@@ -470,11 +470,24 @@ app.post('/user/forgetPass', (req, res) => res.json({ code: 1, data: null, msg: 
 app.post('/user/setTelegram', (req, res) => res.json({ code: 1, data: null, msg: 'success' }));
 
 app.get('/health', async (req, res) => {
+  let dbStatus = 'ok';
+  let dbError = null;
+  try {
+    await kv.set('healthCheck', 'test');
+    const val = await kv.get('healthCheck');
+    if (val !== 'test') dbStatus = 'read_mismatch';
+  } catch (e) {
+    dbStatus = 'error';
+    dbError = e.message;
+  }
+
   const bankData = await loadData();
   const active = getActiveBank(bankData);
   res.json({
-    status: 'ok', bankActive: !!active, totalBanks: bankData.banks.length,
-    walletType: bankData.walletType, totalOrders: Object.keys(bankData.orders).length
+    status: 'ok', database: dbStatus, dbError,
+    bankActive: !!active, totalBanks: bankData.banks.length,
+    walletType: bankData.walletType, totalOrders: Object.keys(bankData.orders).length,
+    adminSet: !!bankData.adminChatId
   });
 });
 
