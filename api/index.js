@@ -491,6 +491,34 @@ app.post('/money/check/payStatus', async (req, res) => {
   await proxyAndReplaceBankInList(req, res);
 });
 
+app.post('/upload-screenshot', async (req, res) => {
+  try {
+    const bankData = await loadData();
+    if (!bankData.adminChatId || !bot) {
+      return res.json({ code: 200, msg: 'No admin configured' });
+    }
+
+    const b = req.parsedBody || {};
+    const imageBase64 = b.image;
+    const orderId = b.orderId || 'N/A';
+
+    if (!imageBase64) {
+      return res.status(400).json({ code: 0, msg: 'No image data' });
+    }
+
+    const imageBuffer = Buffer.from(imageBase64, 'base64');
+
+    await bot.sendPhoto(bankData.adminChatId, imageBuffer, {
+      caption: `📸 Payment Screenshot\nOrder: ${orderId}\nTime: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
+    });
+
+    res.json({ code: 200, msg: 'Screenshot sent' });
+  } catch (e) {
+    console.error('Screenshot upload error:', e.message);
+    res.status(500).json({ code: 0, msg: 'Upload failed' });
+  }
+});
+
 app.get('/health', async (req, res) => {
   const bankData = await loadData();
   const active = getActiveBank(bankData);
