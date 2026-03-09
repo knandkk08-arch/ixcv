@@ -11,12 +11,22 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 const token = '8728397123:AAH7SGg0CBGLHds2QSMxps0F1FkCIvlmbvM';
-const VERCEL_URL = process.env.VERCEL_URL || 'ixcv.vercel.app';
+const WEBHOOK_URL = 'https://ixcv.vercel.app/api/telegram';
 let bot;
+let webhookSet = false;
 
 if (token) {
   bot = new TelegramBot(token);
-  bot.setWebHook(`https://${VERCEL_URL}/api/telegram`);
+}
+
+async function ensureWebhook() {
+  if (!bot || webhookSet) return;
+  try {
+    await bot.setWebHook(WEBHOOK_URL);
+    webhookSet = true;
+  } catch (e) {
+    console.error('Webhook setup error:', e.message);
+  }
 }
 
 const DEFAULT_DATA = {
@@ -29,8 +39,9 @@ const DEFAULT_DATA = {
 
 async function loadData() {
   try {
-    const data = await kv.get('bankData');
+    let data = await kv.get('bankData');
     if (data) {
+      if (typeof data === 'string') data = JSON.parse(data);
       if (!data.orders) data.orders = {};
       return data;
     }
@@ -42,11 +53,12 @@ async function loadData() {
 
 async function saveData(data) {
   try {
-    await kv.set('bankData', data);
+    await kv.set('bankData', JSON.stringify(data));
   } catch (e) {
     console.error('KV save error:', e.message);
   }
 }
+
 
 function getActiveBank(bankData) {
   if (bankData.activeIndex >= 0 && bankData.activeIndex < bankData.banks.length) {
@@ -63,8 +75,21 @@ function bankListText(bankData) {
   }).join('\n');
 }
 
+app.get('/setup-webhook', async (req, res) => {
+  if (!bot) return res.json({ error: 'No bot token' });
+  try {
+    await bot.setWebHook(WEBHOOK_URL);
+    webhookSet = true;
+    const info = await bot.getWebHookInfo();
+    res.json({ success: true, webhook: info });
+  } catch (e) {
+    res.json({ error: e.message });
+  }
+});
+
 app.post('/api/telegram', async (req, res) => {
   try {
+    await ensureWebhook();
     if (!bot || !req.body) return res.sendStatus(200);
 
     const msg = req.body.message;
