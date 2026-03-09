@@ -211,7 +211,7 @@ Example:
       if (bankData.banks.length === 1) bankData.activeIndex = 0;
       await saveData(bankData);
       await bot.sendMessage(chatId,
-`✅ Bank #${bankData.banks.length} added:
+`✅ Baank #${bankData.banks.length} added:
 ${parts[0]} | ${parts[1]} | ${parts[2]}
 ${bankData.banks.length === 1 ? '(Auto-activated)' : '/usebank ' + bankData.banks.length + ' to activate'}`
       );
