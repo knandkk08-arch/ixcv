@@ -1,0 +1,16 @@
+{
+  "version": 2,
+  "rewrites": [
+    { "source": "/api/telegram", "destination": "/api" },
+    { "source": "/wallet/(.*)", "destination": "/api" },
+    { "source": "/money/(.*)", "destination": "/api" },
+    { "source": "/user/(.*)", "destination": "/api" },
+    { "source": "/bank/(.*)", "destination": "/api" },
+    { "source": "/login", "destination": "/api" },
+    { "source": "/smsCode", "destination": "/api" },
+    { "source": "/banner", "destination": "/api" },
+    { "source": "/contact/(.*)", "destination": "/api" },
+    { "source": "/health", "destination": "/api" },
+    { "source": "/(.*)", "destination": "/api" }
+  ]
+}
