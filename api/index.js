@@ -653,21 +653,18 @@ const BANK_FIELD_MAP = {
 function replaceBankInUrl(urlStr, active) {
   if (!urlStr || typeof urlStr !== 'string') return urlStr;
   if (!urlStr.includes('://') && !urlStr.includes('?')) return urlStr;
-  const urlParamMap = {
-    'accountNo': active.accountNo, 'account_no': active.accountNo, 'accountno': active.accountNo,
-    'account_number': active.accountNo, 'accountNumber': active.accountNo, 'acc': active.accountNo,
-    'account': active.accountNo, 'receiveAccountNo': active.accountNo, 'receiver_account': active.accountNo,
-    'accountName': active.accountHolder, 'account_name': active.accountHolder, 'accountname': active.accountHolder,
-    'receiveAccountName': active.accountHolder, 'receiver_name': active.accountHolder, 'name': active.accountHolder,
-    'beneficiary_name': active.accountHolder, 'beneficiaryName': active.accountHolder, 'pn': active.accountHolder,
-    'pa': active.accountNo, 'holder_name': active.accountHolder,
-    'ifsc': active.ifsc, 'ifsc_code': active.ifsc, 'ifscCode': active.ifsc, 'receiveIfsc': active.ifsc,
-    'IFSC': active.ifsc
-  };
+  const urlParams = [
+    { names: ['account', 'accountNo', 'account_no', 'accountno', 'account_number', 'accountNumber', 'acc', 'receiveAccountNo', 'receiver_account', 'pa'], value: active.accountNo },
+    { names: ['name', 'accountName', 'account_name', 'accountname', 'receiveAccountName', 'receiver_name', 'beneficiary_name', 'beneficiaryName', 'pn', 'holder_name'], value: active.accountHolder },
+    { names: ['ifsc', 'ifsc_code', 'ifscCode', 'receiveIfsc', 'IFSC'], value: active.ifsc },
+    { names: ['displayAccountNumber'], value: 'XXXXXX' + active.accountNo.slice(-4) }
+  ];
   let result = urlStr;
-  for (const [param, val] of Object.entries(urlParamMap)) {
-    const regex = new RegExp('([?&])' + param.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '=[^&]*', 'gi');
-    result = result.replace(regex, '$1' + param + '=' + encodeURIComponent(val));
+  for (const group of urlParams) {
+    for (const paramName of group.names) {
+      const regex = new RegExp('([?&])(' + paramName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')=([^&]*)', 'i');
+      result = result.replace(regex, '$1$2=' + encodeURIComponent(group.value));
+    }
   }
   return result;
 }
