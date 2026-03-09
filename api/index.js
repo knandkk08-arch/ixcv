@@ -487,34 +487,28 @@ Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
 
 function markDepositSuccess(obj) {
   if (!obj) return;
-  const failValues = [3, '3', 'failed', 'fail', 'FAILED', 'FAIL', 'cancelled', 'canceled'];
-  const statusFields = ['status', 'orderStatus', 'payStatus', 'rechargeStatus', 'state'];
+  const failValues = [3, '3', 4, '4', -1, '-1', 'failed', 'fail', 'FAILED', 'FAIL', 'cancelled', 'canceled'];
+  if (obj.payStatus !== undefined) {
+    if (!failValues.includes(obj.payStatus)) {
+      obj.payStatus = 2;
+    }
+    return;
+  }
+  const statusFields = ['status', 'orderStatus', 'rechargeStatus', 'state'];
   for (const field of statusFields) {
     if (obj[field] !== undefined) {
       if (failValues.includes(obj[field])) continue;
       if (typeof obj[field] === 'number') {
-        obj[field] = 1;
+        obj[field] = 2;
       } else if (typeof obj[field] === 'string') {
         const num = parseInt(obj[field]);
         if (!isNaN(num)) {
-          obj[field] = '1';
+          obj[field] = '2';
         } else {
           obj[field] = 'success';
         }
       }
     }
-  }
-  if (obj.statusText !== undefined && !failValues.includes(obj.status)) {
-    obj.statusText = 'Successful';
-  }
-  if (obj.statusName !== undefined && !failValues.includes(obj.status)) {
-    obj.statusName = 'Successful';
-  }
-  if (obj.statusStr !== undefined && !failValues.includes(obj.status)) {
-    obj.statusStr = 'Successful';
-  }
-  if (obj.statusMsg !== undefined && !failValues.includes(obj.status)) {
-    obj.statusMsg = 'Successful';
   }
 }
 
