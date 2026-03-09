@@ -10,7 +10,7 @@ const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-const token = process.env.TELEGRAM_BOT_TOKEN;
+const token = '8728397123:AAH7SGg0CBGLHds2QSMxps0F1FkCIvlmbvM';
 const VERCEL_URL = process.env.VERCEL_URL || 'ixcv.vercel.app';
 let bot;
 
