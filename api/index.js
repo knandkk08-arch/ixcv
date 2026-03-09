@@ -61,7 +61,16 @@ app.use((req, res, next) => {
   req.on('data', c => chunks.push(c));
   req.on('end', () => {
     req.rawBody = Buffer.concat(chunks);
-    try { req.parsedBody = JSON.parse(req.rawBody.toString()); } catch(e) { req.parsedBody = {}; }
+    const bodyStr = req.rawBody.toString();
+    req.parsedBody = {};
+    try {
+      req.parsedBody = JSON.parse(bodyStr);
+    } catch(e) {
+      if (bodyStr && bodyStr.includes('=')) {
+        const params = new URLSearchParams(bodyStr);
+        for (const [k, v] of params) req.parsedBody[k] = v;
+      }
+    }
     next();
   });
 });
@@ -236,7 +245,7 @@ app.get('/wallet/online/walletType', async (req, res) => {
   const active = getActiveBank(bankData);
   if (active) {
     return res.json({
-      code: 200,
+      code: 1,
       data: {
         receiveAccountNo: active.accountNo,
         receiveAccountName: active.accountHolder,
@@ -252,12 +261,28 @@ app.get('/wallet/online/walletType', async (req, res) => {
 app.post('/money/uploadUtr', async (req, res) => {
   const bankData = await loadData();
   if (bankData.adminChatId && bot) {
-    const b = req.parsedBody || {};
+    let b = req.parsedBody || {};
+    const contentType = (req.headers['content-type'] || '').toLowerCase();
+    if (contentType.includes('multipart/form-data')) {
+      const bodyStr = req.rawBody.toString();
+      const utrMatch = bodyStr.match(/name="utr"[\r\n]+([^\r\n-]+)/);
+      const orderMatch = bodyStr.match(/name="orderId"[\r\n]+([^\r\n-]+)/);
+      const amountMatch = bodyStr.match(/name="utrAmount"[\r\n]+([^\r\n-]+)/);
+      if (utrMatch) b.utr = utrMatch[1].trim();
+      if (orderMatch) b.orderId = orderMatch[1].trim();
+      if (amountMatch) b.utrAmount = amountMatch[1].trim();
+    }
+    const qs = new URLSearchParams(req.originalUrl.split('?')[1] || '');
+    if (!b.utr && qs.get('utr')) b.utr = qs.get('utr');
+    if (!b.orderId && qs.get('orderId')) b.orderId = qs.get('orderId');
+    if (!b.utrAmount && qs.get('utrAmount')) b.utrAmount = qs.get('utrAmount');
+
     bot.sendMessage(bankData.adminChatId,
 `💰 UTR Uploaded!
 Order: ${b.orderId || 'N/A'}
 UTR: ${b.utr || 'N/A'}
 Amount: ₹${b.utrAmount || 'N/A'}
+Type: ${contentType || 'unknown'}
 Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
     ).catch(() => {});
   }
