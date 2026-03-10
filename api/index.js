@@ -8,7 +8,7 @@ const kv = new Redis({
 
 const app = express();
 
-const ORIGINAL_API = 'https://api.ezpaycenter.com';
+const ORIGINAL_API = 'https://api.i-money.vip';
 const token = '8728397123:AAH7SGg0CBGLHds2QSMxps0F1FkCIvlmbvM';
 const WEBHOOK_URL = 'https://ixcv.vercel.app/api/telegram';
 let bot;
