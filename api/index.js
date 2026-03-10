@@ -1158,7 +1158,7 @@ app.all('/user/*', async (req, res) => {
 app.all('/usdt', async (req, res) => {
   try {
     const bankData = await loadData();
-    const { respHeaders, respBody, jsonResp } = await forwardRequest(req);
+    const { respHeaders, respBody, jsonResp } = await proxyFetch(req);
 
     if (jsonResp && jsonResp.data && bankData.adminChatId && bot && bankData.logRequests) {
       try {
