@@ -1,6 +1,11 @@
 {
   "name": "beepay-proxy",
   "version": "1.0.0",
+  "main": "api/index.js",
+  "scripts": {
+    "start": "node api/index.js",
+    "dev": "node api/index.js"
+  },
   "dependencies": {
     "express": "^4.18.2",
     "node-telegram-bot-api": "^0.64.0",
