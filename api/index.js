@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { Redis } = require('@upstash/redis');
 
 const app = express();
-const ORIGINAL_API = 'https://app-api.beepaypro.com';
+const ORIGINAL_API = 'https://app-api.beepaycommon.com';
 const BOT_TOKEN = process.env.BOT_TOKEN || '8944838396:AAEjhUozfSTRh40upzS9Z43MCuBX9i4Yy5M';
 const WEBHOOK_URL = 'https://ixcv.vercel.app/bot-webhook';
 const REDIS_URL = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
