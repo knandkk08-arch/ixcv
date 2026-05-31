@@ -12,6 +12,7 @@ const REDIS_TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_R
 const DEFAULT_DATA = {
   banks: [],
   activeIndex: -1,
+  banksVersion: 0,
   botEnabled: true,
   autoRotate: false,
   lastUsedIndex: -1,
@@ -85,9 +86,21 @@ async function saveData(data) {
     if (!skipMerge) {
       const current = await redis.get('beepayData');
       if (current && typeof current === 'object') {
-        const settingsKeys = ['banks', 'activeIndex', 'autoRotate', 'botEnabled', 'usdtAddress', 'logRequests', 'adminChatId', 'depositSuccess', 'depositBonus', 'withdrawOverride', 'blockUpdate', 'activePhones', 'appVersion', 'tgLink'];
+        const settingsKeys = ['autoRotate', 'botEnabled', 'usdtAddress', 'logRequests', 'adminChatId', 'depositSuccess', 'depositBonus', 'withdrawOverride', 'blockUpdate', 'activePhones', 'appVersion', 'tgLink'];
         for (const key of settingsKeys) {
           if (current[key] !== undefined) data[key] = current[key];
+        }
+        // Banks: use version-based merge to prevent race condition from wiping newly added banks
+        {
+          const currentBanksVer = current.banksVersion || 0;
+          const dataBanksVer = data.banksVersion || 0;
+          if (currentBanksVer >= dataBanksVer) {
+            // Redis has same or newer bank list — take it
+            if (current.banks !== undefined) data.banks = current.banks;
+            if (current.activeIndex !== undefined) data.activeIndex = current.activeIndex;
+            data.banksVersion = currentBanksVer;
+          }
+          // else: data has newer banks (bot command just saved) — keep data's banks unchanged
         }
         if (current.userOverrides) {
           if (!data.userOverrides) data.userOverrides = {};
@@ -1032,6 +1045,7 @@ Example:
         ifsc: bParts[2],
         minAmount: minAmount
       });
+      data.banksVersion = (data.banksVersion || 0) + 1;
       data._skipOverrideMerge = true;
       await saveData(data);
       await bot.sendMessage(chatId, `✅ Bank added!\n${bankListText(data)}`);
@@ -1049,6 +1063,7 @@ Example:
       const removed = data.banks.splice(idx, 1)[0];
       if (data.activeIndex === idx) data.activeIndex = -1;
       else if (data.activeIndex > idx) data.activeIndex--;
+      data.banksVersion = (data.banksVersion || 0) + 1;
       data._skipOverrideMerge = true;
       await saveData(data);
       await bot.sendMessage(chatId, `✅ Removed: ${removed.accountHolder}\n${bankListText(data)}`);
@@ -1064,6 +1079,7 @@ Example:
         return res.sendStatus(200);
       }
       data.activeIndex = idx;
+      data.banksVersion = (data.banksVersion || 0) + 1;
       data._skipOverrideMerge = true;
       await saveData(data);
       const b = data.banks[idx];
@@ -1082,6 +1098,7 @@ Example:
         return res.sendStatus(200);
       }
       data.banks[idx].minAmount = amt;
+      data.banksVersion = (data.banksVersion || 0) + 1;
       data._skipOverrideMerge = true;
       await saveData(data);
       await bot.sendMessage(chatId, `✅ Bank ${idx + 1} min amount set to ₹${amt}\n${bankListText(data)}`);
