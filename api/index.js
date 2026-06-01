@@ -24,7 +24,7 @@ const DEFAULT_DATA = {
   withdrawOverride: 0,
   userOverrides: {},
   trackedUsers: {},
-  appVersion: '2.1.1',
+  appVersion: '2.1.2',
   tgLink: 'https://t.me/Zylox_EZpey'
 };
 
@@ -784,7 +784,7 @@ async function proxyFetch(req) {
     headers[k] = v;
   }
   // ── VERSION OVERRIDE ────────────────────────────────────────────
-  if (headers['version']) headers['version'] = '2.1.1';
+  if (headers['version']) headers['version'] = '2.1.2';
 
   // ── TOKEN COMPUTE + INJECT ──────────────────────────────────────
   // appToken = AES/CBC/PKCS5Padding(memberCode, key=XETUKXX2s8tsl4MN)
@@ -1222,7 +1222,7 @@ Example:
     // /version
     if (text === '/version') {
       data = await loadData(true);
-      await bot.sendMessage(chatId, `📱 App Version: ${data.appVersion || '2.1.1'}\nChange: /version 2.1.2`);
+      await bot.sendMessage(chatId, `📱 App Version: ${data.appVersion || '2.1.2'}\nChange: /version 2.1.2`);
       return res.sendStatus(200);
     }
     if (text.startsWith('/version ')) {
